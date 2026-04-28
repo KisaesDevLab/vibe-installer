@@ -81,15 +81,21 @@ die()  { err "$*"; exit 1; }
 # Done BEFORE require_root so even an early "not running as root" failure
 # is captured. Falls back to /tmp if /var/log isn't writable yet.
 _setup_install_log() {
-    # Pick a log path. Prefer /var/log/vibe/ (canonical) if writable;
-    # /tmp/ otherwise (early failure cases — apt not yet installed,
-    # /var/log permissions etc.).
+    # Pick a log path. Prefer /var/log/vibe/ (canonical). If the parent
+    # /var/log exists and we're root (we should be — but be defensive),
+    # create /var/log/vibe up-front so the FIRST run's log lands there
+    # alongside subsequent runs. Falls back to /tmp/ in pathological
+    # cases (read-only /var, missing /var, etc.).
     local logdir="$VIBE_LOG"
-    local logpath
+    if [ ! -d "$logdir" ] && [ "$(id -u)" -eq 0 ] && [ -d /var/log ]; then
+        # Mode 0755 + root-owned for now; ensure_user_and_dirs reconciles
+        # ownership later in the same run (chown root → vibe).
+        mkdir -p "$logdir" 2>/dev/null && chmod 0755 "$logdir" 2>/dev/null
+    fi
     if [ ! -d "$logdir" ] || ! { : >> "$logdir/.write-test" 2>/dev/null && rm "$logdir/.write-test"; }; then
         logdir="/tmp"
     fi
-    logpath="$logdir/install-$(date -u +%Y%m%dT%H%M%SZ).log"
+    local logpath="$logdir/install-$(date -u +%Y%m%dT%H%M%SZ).log"
 
     # `tee -a` opens the file in append mode. process substitution
     # (>(...)) creates an FD that bash redirects stdout/stderr into.

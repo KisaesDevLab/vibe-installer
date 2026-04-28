@@ -187,6 +187,8 @@ apps_install() {
     fi
 
     config_commit
+    # Clear the promotion marker — install succeeded, no recovery needed.
+    rm -f "${VIBE_DATA}/.install-promoted-flag" 2>/dev/null || true
     ok "${app} installed"
 }
 
@@ -206,6 +208,11 @@ _apps_install_workload() {
         while IFS= read -r a; do existing+=("$a"); done < <(config_installed_list)
         if [ "${#existing[@]}" -gt 0 ]; then
             mode_promote_to_multi "${existing[@]}"
+            # Drop a marker the parent's rollback path can read. Promotion
+            # succeeded; if the per-app installer below fails, vibe.conf
+            # rollback alone won't reverse the mode flip — the marker
+            # tells apps_install_rollback to print the recovery hint.
+            : > "${VIBE_DATA}/.install-promoted-flag" 2>/dev/null || true
         else
             config_set mode multi
             ingress_up
@@ -235,6 +242,36 @@ apps_install_rollback() {
     # worse than the alternative).
     if has_cmd docker && [ -f "$(secrets_env_path "$app")" ]; then
         apps_compose "$app" down --remove-orphans 2>/dev/null || true
+    fi
+
+    # If the failed install promoted single→multi BEFORE crashing, the
+    # appliance is now in a mixed state: vibe.conf says single (after
+    # config_restore), but the host is actually running Caddy + the
+    # previously-installed app(s) in multi-app shape. Surface this so
+    # the operator can recover instead of chasing ghost behavior.
+    #
+    # The flag file is dropped by _apps_install_workload right after
+    # mode_promote_to_multi succeeds (since the workload runs in a
+    # subshell, an env var wouldn't propagate back to this function).
+    if [ -f "${VIBE_DATA}/.install-promoted-flag" ]; then
+        rm -f "${VIBE_DATA}/.install-promoted-flag"
+        echo
+        warn "================ partial recovery ================"
+        warn "  This install promoted the host to multi-app mode before"
+        warn "  failing. vibe.conf was rolled back to its pre-install"
+        warn "  state, but the existing app(s) are still running in"
+        warn "  multi-app shape and the Caddy ingress is up."
+        warn ""
+        warn "  Pick ONE recovery path:"
+        warn ""
+        warn "  A) Stay multi-app, fix the underlying issue, retry:"
+        warn "       sudo vibe mode multi              # re-sync state"
+        warn "       sudo vibe install ${app}      # retry install"
+        warn ""
+        warn "  B) Demote back to single-app:"
+        warn "       sudo vibe mode single             # tear down ingress"
+        warn "                                        # + restart sole app"
+        warn "===================================================="
     fi
 }
 
