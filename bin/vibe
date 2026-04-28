@@ -43,8 +43,40 @@ fi
 . "$VIBE_PREFIX/lib/tools.sh"
 # shellcheck source=lib/update_check.sh
 . "$VIBE_PREFIX/lib/update_check.sh"
+# shellcheck source=lib/report.sh
+. "$VIBE_PREFIX/lib/report.sh"
 
 VIBE_VERSION="0.1.0-dev"
+
+# ---------- CLI logging ----------
+# Append every state-mutating CLI invocation to /var/log/vibe/cli.log so
+# `vibe report` can bundle it. Read-only commands (status, doctor, mode,
+# version, help, upgrade-check, license, cloudflare status) skip the
+# tee — they're chatty and uninteresting from a triage standpoint.
+#
+# Done after lib sourcing (so common.sh's $VIBE_LOG is available) and
+# only when running as root + the install dir exists.
+_should_log_cmd() {
+    case "${1:-}" in
+        ""|help|-h|--help|version|-v|--version|status|doctor|mode|upgrade-check|logs|license|cloudflare|report) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+if [ "$(id -u)" -eq 0 ] && _should_log_cmd "${1:-}"; then
+    install -d -m 0755 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_LOG" 2>/dev/null || true
+    if [ -d "$VIBE_LOG" ] && [ -w "$VIBE_LOG" ]; then
+        # Single rolling file (cli.log); each invocation gets a banner
+        # so report-bundling can split runs.
+        export VIBE_CLI_LOG="$VIBE_LOG/cli.log"
+        {
+            printf '\n========== vibe %s :: %s ==========\n' "$*" "$(date -Is)"
+        } >> "$VIBE_CLI_LOG"
+        # Tee subsequent stdout+stderr through the log AND to the terminal.
+        exec > >(tee -a "$VIBE_CLI_LOG") 2>&1
+        # Footer on exit so we can tell where one run ends and the next begins.
+        trap '_rc=$?; printf "========== vibe rc=%d ==========\n" "$_rc" >> "$VIBE_CLI_LOG" 2>/dev/null || true; exit $_rc' EXIT
+    fi
+fi
 
 # Auto-migrate legacy mode=single configs at every root invocation. Without
 # root we can't bring containers up, so we skip silently (the operator's
@@ -78,6 +110,9 @@ Lifecycle:
   uninstall --all           Tear down everything (with confirmation).
   upgrade <app> [--to VER]  Pull a new image tag and migrate.
   upgrade-check             List newer GHCR tags (read-only — never auto-applies).
+  report [<dir>]            Bundle install + cli logs, vibe state, container
+                            logs, redacted env files, and host info into a
+                            single tarball for support triage.
 
 Operational:
   logs <app> [service]      Tail container logs.
@@ -217,6 +252,11 @@ cmd_cloudflare() {
     esac
 }
 
+cmd_report() {
+    require_root
+    report_bundle "$@"
+}
+
 cmd_upgrade_check() {
     # `--json` switches to a structured emitter consumed by vibed's
     # handleAppsUpgradeCheck (which is in turn consumed by the admin
@@ -263,6 +303,7 @@ main() {
         license)               cmd_license "$@" ;;
         cloudflare)            cmd_cloudflare "$@" ;;
         upgrade-check)         cmd_upgrade_check "$@" ;;
+        report)                cmd_report "$@" ;;
         # Future:
         rotate-secrets)
             cmd_unimplemented "$cmd" "$@"

@@ -67,6 +67,52 @@ warn() { printf '%s[ warn  ]%s %s\n' "$_YEL" "$_R" "$*" >&2; }
 err()  { printf '%s[ error ]%s %s\n' "$_RED" "$_R" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
+# ---------- Install-time logging ----------
+# Tee everything install.sh emits (stdout + stderr) into a persistent log
+# at /var/log/vibe/install.log so an operator who hits an issue can send
+# us the file (and we can run `vibe report` to bundle it). Without this,
+# `curl|bash` output scrolls off the terminal and is gone forever.
+#
+# The `tee` is set up via exec replacement of stdout/stderr, so every
+# subsequent printf / command output is captured. Color codes are
+# embedded — that's fine for a UTF-8-safe text editor + the operator
+# can `cat -v install.log` if they want to see them rendered.
+#
+# Done BEFORE require_root so even an early "not running as root" failure
+# is captured. Falls back to /tmp if /var/log isn't writable yet.
+_setup_install_log() {
+    # Pick a log path. Prefer /var/log/vibe/ (canonical) if writable;
+    # /tmp/ otherwise (early failure cases — apt not yet installed,
+    # /var/log permissions etc.).
+    local logdir="$VIBE_LOG"
+    local logpath
+    if [ ! -d "$logdir" ] || ! { : >> "$logdir/.write-test" 2>/dev/null && rm "$logdir/.write-test"; }; then
+        logdir="/tmp"
+    fi
+    logpath="$logdir/install-$(date -u +%Y%m%dT%H%M%SZ).log"
+
+    # `tee -a` opens the file in append mode. process substitution
+    # (>(...)) creates an FD that bash redirects stdout/stderr into.
+    # The log path is exported so other parts of the installer (and a
+    # future `vibe report`) can find this run's log.
+    export VIBE_INSTALL_LOG="$logpath"
+    exec > >(tee -a "$logpath") 2>&1
+    printf '\n========== install.sh start: %s ==========\n' "$(date -Is)"
+    printf 'log file: %s\n' "$logpath"
+    printf 'invocation: %s\n' "${BASH_SOURCE[0]:-/dev/stdin}"
+    printf 'env (selected): VIBE_PREFIX=%s VIBE_REF=%s VIBE_ASSUME_YES=%s VIBE_HOST=%s VIBE_TLS_MODE=%s\n' \
+        "$VIBE_PREFIX" "$VIBE_REF" "${VIBE_ASSUME_YES:-0}" "${VIBE_HOST:-<unset>}" "${VIBE_TLS_MODE:-<unset>}"
+    printf '==========================================================\n\n'
+}
+_setup_install_log
+
+# Final newline + footer at exit so `vibe report` knows the run boundary.
+_install_log_footer() {
+    local rc=$?
+    printf '\n========== install.sh exit: %s rc=%d ==========\n' "$(date -Is)" "$rc"
+}
+trap _install_log_footer EXIT
+
 # ---------- Pre-flight ----------
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "install.sh must run as root (try: curl ... | sudo bash)"
@@ -962,13 +1008,17 @@ EOM
     sudo vibe install tools           Portainer + Duplicati admin tools
 
   Useful CLI:
-    vibe status                       Installed apps + appliance state
-    sudo vibe doctor                  Run health checks
-    vibe help                         Full command reference
+    vibe status                       Installed apps + appliance state.
+    sudo vibe doctor                  Run health checks.
+    sudo vibe report                  Bundle install logs + state into one
+                                      tarball you can send for support
+                                      (secrets are auto-redacted).
+    vibe help                         Full command reference.
 
   Config: $VIBE_ETC/vibe.conf
   Repo:   $VIBE_PREFIX
-  Logs:   $VIBE_LOG
+  Logs:   $VIBE_LOG/install-*.log  (this run: ${VIBE_INSTALL_LOG:-tee disabled})
+          $VIBE_LOG/cli.log        (state-mutating vibe invocations)
 
 EOM
 }
