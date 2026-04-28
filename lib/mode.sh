@@ -118,19 +118,35 @@ mode_force() {
     local installed
     installed="$(config_installed_list)"
 
-    # Zero-apps case is a no-op for `single` (nothing to demote) but for
-    # `multi` we still bring up the ingress so the appliance is reachable
-    # at https://<host>/ immediately. install.sh relies on this.
-    if [ -z "$installed" ]; then
-        if [ "$cur" != "$target" ]; then
-            config_set mode "$target"
-            ok "mode set to ${target}"
+    # Set mode if changing — cheap, harmless to re-set the same value.
+    if [ "$cur" != "$target" ]; then
+        config_set mode "$target"
+        ok "mode changed to ${target}"
+    fi
+
+    # `vibe mode multi` is the canonical "make the ingress reflect current
+    # vibe.conf" command. install.sh relies on this — when render_config
+    # back-fills a new field (e.g. host_ip after the IP-SAN fix), the
+    # subsequent `vibe mode multi` call needs to RE-RENDER the Caddyfile
+    # AND signal Caddy to pick up the change. Short-circuiting here on
+    # "mode is already multi" was a real bug: Caddy kept serving a stale
+    # cert because the Caddyfile on disk hadn't moved.
+    if [ "$target" = "multi" ]; then
+        if ingress_running; then
+            ingress_reload   # re-renders + SIGHUPs
         else
-            ok "mode is already ${cur}"
-        fi
-        if [ "$target" = "multi" ] && ! ingress_running; then
             ingress_up
             ingress_trust_local_ca
+        fi
+        ok "ingress is reflecting current ${VIBE_CONF}"
+        return 0
+    fi
+
+    # target=single from here. If we were already single, nothing to do
+    # other than (no-op-ly) confirm.
+    if [ -z "$installed" ]; then
+        if [ "$cur" = "$target" ]; then
+            ok "mode is already single (no apps installed)"
         fi
         return 0
     fi
@@ -140,18 +156,15 @@ mode_force() {
         return 0
     fi
 
-    if [ "$target" = "multi" ]; then
-        local apps=()
-        while IFS= read -r a; do apps+=("$a"); done <<< "$installed"
-        mode_promote_to_multi "${apps[@]}"
-    else
-        local count
-        count=$(printf '%s\n' "$installed" | wc -l | tr -d ' ')
-        if [ "$count" -ne 1 ]; then
-            die "cannot force single mode with ${count} apps installed; uninstall first"
-        fi
-        mode_demote_to_single "$installed"
+    # target=single, currently multi, with apps installed. Only allow
+    # demotion when exactly one app remains; otherwise the operator must
+    # uninstall first.
+    local count
+    count=$(printf '%s\n' "$installed" | wc -l | tr -d ' ')
+    if [ "$count" -ne 1 ]; then
+        die "cannot force single mode with ${count} apps installed; uninstall first"
     fi
+    mode_demote_to_single "$installed"
 }
 
 # ---------- Migration: legacy single → always-multi ----------
