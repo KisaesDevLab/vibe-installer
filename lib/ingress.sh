@@ -32,6 +32,11 @@ ingress_ensure_dirs() {
 
 ingress_render_envfile() {
     require_root
+    # Ensure /etc/vibe/ingress/ exists before redirecting `> "$env"` into it.
+    # ingress_render_caddyfile also calls this, but envfile rendering happens
+    # first in ingress_up — so without an explicit call here the redirect
+    # fails with "No such file or directory".
+    ingress_ensure_dirs
     local env
     env="$(ingress_envfile_path)"
     local host tls email
