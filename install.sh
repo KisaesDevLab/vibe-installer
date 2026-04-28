@@ -105,6 +105,67 @@ verify_host() {
     ok "host: ${ID:-?} ${VERSION_ID:-?} on $(uname -m), ${mem_gb} GB RAM, ${disk_gb} GB free in /var"
 }
 
+# ---------- Port 80/443 conflict check ----------
+# Caddy needs both, exclusively. The most common failure path is a
+# pre-existing nginx/apache that ships on the OS image — those silently
+# bind :80 and the Caddy compose `up` then returns "address already in
+# use", leaving the install in a half-bootstrapped state. Detect upfront
+# and fail with a message that names the offender so the operator knows
+# exactly what to disable.
+#
+# Skipped when our own Caddy is already running (re-run case): the port
+# IS bound, but by us, and that's fine.
+verify_ports_free() {
+    log "checking ports 80 + 443 are free for Caddy..."
+
+    # Re-run case: our own Caddy already owns the ports. Don't trip on it.
+    if command -v docker >/dev/null 2>&1 \
+       && docker ps --filter 'name=^vibe-ingress-caddy$' --format '{{.Names}}' 2>/dev/null \
+            | grep -qx vibe-ingress-caddy; then
+        ok "Caddy ingress already running (re-run); ports 80/443 owned by vibe-ingress-caddy"
+        return 0
+    fi
+
+    if ! command -v ss >/dev/null 2>&1; then
+        warn "ss not installed — can't pre-check port conflicts. apt-get will install iproute2 next."
+        return 0
+    fi
+
+    local listeners_80 listeners_443 offender
+    # `ss -tlnpH` = TCP / listening / numeric / program / no header. Filter
+    # for port :80 / :443 in the local-address column ($4).
+    listeners_80="$(ss -tlnpH 2>/dev/null | awk '$4 ~ /:80$/  { print }')"
+    listeners_443="$(ss -tlnpH 2>/dev/null | awk '$4 ~ /:443$/ { print }')"
+
+    if [ -z "$listeners_80" ] && [ -z "$listeners_443" ]; then
+        ok "ports 80 + 443 are free"
+        return 0
+    fi
+
+    err "port conflict — Caddy needs 80 + 443 exclusive, but:"
+    if [ -n "$listeners_80" ]; then
+        offender="$(printf '%s' "$listeners_80" | head -1 | sed 's/.*users:((//; s/),.*/)/')"
+        err "  port 80  is bound by: ${offender:-(unknown — run 'sudo ss -tlnp | grep :80')}"
+    fi
+    if [ -n "$listeners_443" ]; then
+        offender="$(printf '%s' "$listeners_443" | head -1 | sed 's/.*users:((//; s/),.*/)/')"
+        err "  port 443 is bound by: ${offender:-(unknown — run 'sudo ss -tlnp | grep :443')}"
+    fi
+
+    cat >&2 <<'EOM'
+
+  Most common cause: the OS image ships with nginx (or apache2) enabled.
+  Free the ports with:
+
+    sudo systemctl disable --now nginx apache2 2>/dev/null
+    sudo apt-get purge -y nginx nginx-common nginx-core apache2 2>/dev/null
+
+  Then re-run the install.
+
+EOM
+    die "ports 80/443 not free — refusing to clobber an existing service"
+}
+
 # ---------- Apt prerequisites ----------
 ensure_packages() {
     log "ensuring apt prerequisites (curl, git, ca-certificates, gnupg, openssl, jq, gettext-base)..."
@@ -700,6 +761,10 @@ main() {
     log "vibe-installer bootstrap starting (ref=$VIBE_REF)"
     verify_host
     ensure_packages
+    # Port-binding check runs AFTER ensure_packages so iproute2 (which
+    # provides `ss`) is guaranteed present, and BEFORE ensure_docker so we
+    # don't install Docker only to discover :80 is taken.
+    verify_ports_free
     ensure_docker
     ensure_user_and_dirs
     ensure_repo
