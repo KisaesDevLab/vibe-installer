@@ -212,10 +212,26 @@ ensure_user_and_dirs() {
         usermod -aG docker "$VIBE_USER" 2>/dev/null || true
     fi
 
-    install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_ETC"
-    install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_DATA"
-    install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_LOG"
+    # Top-level dirs are 0755 (world-traversable) so non-root operators
+    # can run read-only commands like `vibe status`, `vibe doctor`, and
+    # `vibe upgrade-check`. Secrets aren't exposed by this — every per-app
+    # subdirectory inside (and every .env/postgres_password file) stays
+    # 0700/0600 owned by vibe:vibe. Without 0755 here, an unprivileged
+    # operator running `vibe status` gets:
+    #   [warn] no vibe configuration found at /etc/vibe/vibe.conf
+    # because the parent dir's traversal is blocked even though the conf
+    # itself is 0644. The 0750 default was over-tight for a single-tenant
+    # CPA-firm appliance where the operator's account is the only
+    # non-root user.
+    install -d -m 0755 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_ETC"
+    install -d -m 0755 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_DATA"
+    install -d -m 0755 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_LOG"
     install -d -m 0700 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_DATA/.archive"
+
+    # On a re-run with pre-existing 0750 dirs (the previous default),
+    # `install -d` with -m 0755 doesn't widen the mode — it only sets
+    # mode at create time. Force it.
+    chmod 0755 "$VIBE_ETC" "$VIBE_DATA" "$VIBE_LOG" 2>/dev/null || true
     # Restore drop-dir — where operators SCP backup tarballs that they
     # want to restore from elsewhere. Listed by vibed's
     # apps.backups.drop_list RPC. Mode 0700 owned by vibe:vibe; the
