@@ -458,15 +458,23 @@ ensure_ingress() {
 }
 
 # ---------- Install the vibed daemon ----------
-# vibed is the JSON-RPC daemon that the admin web app talks to. Installs
-# in three steps:
-#   1. Place the binary at /usr/local/bin/vibed. Tries (a) a pre-built
-#      release artifact from GitHub, (b) a locally-built binary at
-#      tools/vibed/vibed if the operator built it themselves. If neither
-#      is available (e.g., dev branch with no release yet), the systemd
-#      unit is still installed but disabled, and a build hint is printed.
-#   2. Install /etc/systemd/system/vibed.service from the repo.
-#   3. systemctl enable --now vibed.
+# vibed is the JSON-RPC daemon that the admin web app talks to. The
+# binary acquisition strategy walks four sources in order, falling
+# through cleanly until something works:
+#
+#   1. Pinned release tag — download from
+#      releases/download/${VIBE_REF}/vibed-linux-<arch>. Works for
+#      tagged refs (e.g. v0.1.0). 404s when VIBE_REF is a branch name.
+#   2. `latest` release — download from releases/latest/download/.
+#      Picks up whatever the most recent v* tag published. Works for
+#      curl|bash from `main` once at least one release exists.
+#   3. Pre-built local binary at tools/vibed/vibed (developer convenience).
+#   4. Source build — apt-install golang-go (if not present), cd into
+#      tools/vibed, `go build`. vibed is stdlib-only so no module
+#      fetches and no go.sum to honor; build is ~30s on a small box.
+#
+# Step 4 means a curl|bash from `main` always produces a working daemon,
+# even before the first vibe-installer release tag is cut.
 ensure_vibed() {
     local arch_tag
     case "$(uname -m)" in
@@ -478,35 +486,67 @@ ensure_vibed() {
     local binary_target="/usr/local/bin/vibed"
     local unit_target="/etc/systemd/system/vibed.service"
     local unit_source="$VIBE_PREFIX/etc/systemd/system/vibed.service"
+    local src_dir="$VIBE_PREFIX/tools/vibed"
 
-    # Skip if already installed and the binary on disk is recent enough
-    # (no version pin yet — re-running install.sh re-fetches).
     if [ -x "$binary_target" ]; then
         ok "vibed binary present at $binary_target"
     else
-        # Try the release download first. The release pipeline publishes
-        # vibed-linux-amd64 / vibed-linux-arm64 alongside the install.sh
-        # tag. If VIBE_REF isn't a release tag (e.g., 'main'), this 404s
-        # and we fall through.
-        local url="https://github.com/KisaesDevLab/vibe-installer/releases/download/${VIBE_REF}/vibed-${arch_tag}"
-        log "vibed: attempting to download from $url..."
-        if curl -fsSL --max-time 30 "$url" -o "$binary_target.tmp" 2>/dev/null; then
-            install -m 0755 "$binary_target.tmp" "$binary_target"
-            rm -f "$binary_target.tmp"
-            ok "vibed: installed from release"
-        elif [ -x "$VIBE_PREFIX/tools/vibed/vibed" ]; then
-            install -m 0755 "$VIBE_PREFIX/tools/vibed/vibed" "$binary_target"
-            ok "vibed: installed from $VIBE_PREFIX/tools/vibed/vibed"
+        local source="" tmp="$binary_target.tmp"
+        rm -f "$tmp" 2>/dev/null || true
+
+        # 1. Tag-pinned release artifact.
+        local pin_url="https://github.com/KisaesDevLab/vibe-installer/releases/download/${VIBE_REF}/vibed-${arch_tag}"
+        if curl -fsSL --max-time 30 "$pin_url" -o "$tmp" 2>/dev/null; then
+            source="release ($VIBE_REF)"
+        # 2. Latest-release fallback (covers curl|bash from `main`).
+        elif curl -fsSL --max-time 30 \
+              "https://github.com/KisaesDevLab/vibe-installer/releases/latest/download/vibed-${arch_tag}" \
+              -o "$tmp" 2>/dev/null; then
+            source="release (latest)"
+        # 3. Pre-built local binary (developer dropped one in).
+        elif [ -x "$src_dir/vibed" ]; then
+            install -m 0755 "$src_dir/vibed" "$tmp"
+            source="local pre-built binary at $src_dir/vibed"
+        # 4. Source build — last resort but reliably works on any host.
         else
-            rm -f "$binary_target.tmp" 2>/dev/null || true
-            warn "vibed: no binary available — admin web app will not be able to talk to the daemon"
-            warn "vibed: build it yourself with:"
-            warn "vibed:   sudo apt-get install -y golang-go"
-            warn "vibed:   cd $VIBE_PREFIX/tools/vibed && go build -o vibed . && sudo install -m 0755 vibed /usr/local/bin/vibed"
-            warn "vibed:   sudo systemctl restart vibed"
-            # Don't die — install.sh's other steps still produce a working
-            # CLI-only appliance. The admin web app just won't have a
-            # backend until vibed is built.
+            log "vibed: no release artifact for ${VIBE_REF} or :latest, building from source..."
+            if ! command -v go >/dev/null 2>&1; then
+                log "vibed: installing golang-go via apt (one-time, ~200 MB)..."
+                if ! apt-get install -y --no-install-recommends golang-go >/dev/null 2>&1; then
+                    warn "vibed: apt-get install golang-go failed — admin UI buttons won't work"
+                    warn "vibed: try manually: sudo apt-get install -y golang-go"
+                    rm -f "$tmp" 2>/dev/null || true
+                fi
+            fi
+            if command -v go >/dev/null 2>&1 && [ -d "$src_dir" ]; then
+                log "vibed: building (vibed is stdlib-only, ~30s)..."
+                if ( cd "$src_dir" && \
+                     CGO_ENABLED=0 go build \
+                       -trimpath \
+                       -ldflags "-s -w -X main.VibedVersion=${VIBE_REF}-source" \
+                       -o "$tmp" . ); then
+                    chmod 0755 "$tmp"
+                    source="source build (Go $(go version | awk '{print $3}'))"
+                else
+                    warn "vibed: go build failed — admin UI buttons won't work"
+                    warn "vibed: see $src_dir for build errors"
+                    rm -f "$tmp" 2>/dev/null || true
+                fi
+            elif [ ! -d "$src_dir" ]; then
+                warn "vibed: source missing at $src_dir — admin UI buttons won't work"
+            fi
+        fi
+
+        if [ -n "$source" ] && [ -f "$tmp" ]; then
+            install -m 0755 "$tmp" "$binary_target"
+            rm -f "$tmp"
+            ok "vibed: installed from ${source}"
+        else
+            warn "vibed: binary unavailable — CLI works fine; admin UI's product-management"
+            warn "       actions will fail until vibed is on disk. Recover with:"
+            warn "         sudo apt-get install -y golang-go"
+            warn "         sudo bash -c 'cd $src_dir && CGO_ENABLED=0 go build -o /usr/local/bin/vibed .'"
+            warn "         sudo systemctl restart vibed"
         fi
     fi
 
