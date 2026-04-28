@@ -98,7 +98,12 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-3001}:3001"
-    env_file: .env
+    # Absolute path: the installer's apps_compose passes
+    # /etc/vibe/mybooks/.env via --env-file for variable interpolation,
+    # but per-service env_file is a separate mechanism that injects vars
+    # into the container — and resolves relative to the project dir
+    # (/opt/vibe-installer/apps/mybooks) where no .env exists. Pin it.
+    env_file: /etc/vibe/mybooks/.env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-kisbooks}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env for production}@db:5432/${POSTGRES_DB:-kisbooks}
       REDIS_URL: redis://redis:6379
@@ -149,7 +154,7 @@ services:
     pull_policy: missing
     restart: unless-stopped
     command: ["npx", "tsx", "packages/worker/src/index.ts"]
-    env_file: .env
+    env_file: /etc/vibe/mybooks/.env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-kisbooks}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env for production}@db:5432/${POSTGRES_DB:-kisbooks}
       REDIS_URL: redis://redis:6379

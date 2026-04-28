@@ -27,8 +27,6 @@ RestartSec=2
 # in the directives below — no setuid binaries, no kernel-tunable
 # writes, the daemon only writes inside the /etc/vibe + /var/lib/vibe
 # + /var/log/vibe + /run trees.
-RuntimeDirectory=vibe-runtime
-RuntimeDirectoryMode=0750
 
 # Hardening — even running as root, the namespace restrictions below
 # stop a daemon compromise from rewriting random parts of the host.

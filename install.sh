@@ -64,7 +64,8 @@ fi
 log()  { printf '%s[install]%s %s\n' "$_BLU" "$_R" "$*"; }
 ok()   { printf '%s[  ok   ]%s %s\n' "$_GRN" "$_R" "$*"; }
 warn() { printf '%s[ warn  ]%s %s\n' "$_YEL" "$_R" "$*" >&2; }
-die()  { printf '%s[ error ]%s %s\n' "$_RED" "$_R" "$*" >&2; exit 1; }
+err()  { printf '%s[ error ]%s %s\n' "$_RED" "$_R" "$*" >&2; }
+die()  { err "$*"; exit 1; }
 
 # ---------- Pre-flight ----------
 require_root() {
@@ -433,16 +434,26 @@ render_config() {
 # not move them. The 'vibe mode multi' subcommand is idempotent and brings
 # up the ingress with the rendered Caddyfile, even when zero apps are
 # installed (a landing page + /healthz is reachable).
+#
+# Failure here is fatal. The previous behavior was to `warn` and keep
+# going, which left a half-bootstrapped state (no admin stack, missing
+# render output) the user discovered later via `vibe status` saying
+# "no vibe configuration found". verify_ports_free already catches the
+# common port-collision case earlier, so reaching this branch usually
+# means a docker/network problem the operator needs to fix anyway.
 ensure_ingress() {
     log "starting Caddy ingress at :80/:443..."
-    if "$VIBE_PREFIX/bin/vibe" mode multi >/dev/null 2>&1; then
+    local out rc=0
+    out="$("$VIBE_PREFIX/bin/vibe" mode multi 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
         ok "ingress is up"
     else
-        # Don't die — the operator can recover with `sudo vibe doctor` and
-        # `sudo vibe mode multi` once they've fixed whatever the underlying
-        # issue is (port 80 already taken, ufw blocking, etc.).
-        warn "ingress did not come up cleanly — run 'sudo vibe doctor' to diagnose"
-        warn "you can also re-attempt with 'sudo vibe mode multi'"
+        printf '%s\n' "$out" >&2
+        err "ingress failed to come up (rc=$rc)"
+        warn "common causes: docker daemon down, ufw blocking, or a port:80 conflict"
+        warn "  verify_ports_free passed earlier didn't detect — something started after."
+        warn "after fixing the underlying issue, retry with: sudo vibe mode multi"
+        die "aborting — ingress is required before continuing the bootstrap"
     fi
 }
 
@@ -546,6 +557,10 @@ ensure_vibed() {
 # ADMIN_INITIAL_PASSWORD is set by mint_admin_password and read by
 # print_next_steps so the install summary shows the credentials.
 ADMIN_INITIAL_PASSWORD=""
+# Set to 1 by ensure_admin if the stack didn't come up (image denied,
+# pull failed, etc.). print_next_steps reads this so the summary shows
+# the truth instead of pointing the operator at a 404.
+ADMIN_STACK_FAILED=0
 
 mint_admin_password() {
     # 24-char URL-safe token. openssl rand -base64 outputs 28 chars
@@ -605,27 +620,78 @@ ensure_admin() {
 
         ADMIN_INITIAL_PASSWORD="$admin_pw"
         ok "wrote $env_path (mode 0600)"
+
+        # Refuse to bring the stack up with un-substituted @PLACEHOLDER@
+        # tokens still in the env file. Catches a future template change
+        # that introduces a new placeholder install.sh forgot to replace
+        # (every @FOO@ here would crash the admin container at boot).
+        if grep -qE '@[A-Z][A-Z0-9_]*@' "$env_path"; then
+            grep -nE '@[A-Z][A-Z0-9_]*@' "$env_path" >&2
+            die "admin: $env_path still contains @PLACEHOLDER@ tokens — secret render failed"
+        fi
     fi
+
+    # Resolve the host the admin stack should advertise in SITE_URL etc.
+    # On a fresh install render_config sets VIBE_HOST_PICK; on a re-run
+    # render_config short-circuits (config exists) and leaves the global
+    # empty, so we fall back to vibe.conf to avoid baking the default
+    # `vibe.local` into a relaunched admin container on a host whose
+    # real name is something else.
+    local admin_host="$VIBE_HOST_PICK"
+    if [ -z "$admin_host" ] && [ -f "$VIBE_ETC/vibe.conf" ]; then
+        admin_host="$(grep -E '^host=' "$VIBE_ETC/vibe.conf" | cut -d= -f2)"
+    fi
+    [ -z "$admin_host" ] && admin_host="vibe.local"
 
     # Bring up the stack. We always layer the grouped overlay because
     # the host is in always-multi-app mode by design — the single-app
     # ports-published shape exists only as a developer convenience.
     log "starting admin stack..."
-    if ! docker compose \
+
+    # Capture pull stderr so we can distinguish three failure modes:
+    #   - "denied"   → upstream image not published or package is private.
+    #                  Not recoverable from the installer; the operator
+    #                  needs to publish/build the image.
+    #   - "no such host" / "timeout" / etc. → genuine offline/transient.
+    #   - anything else → unknown; keep raw output so it isn't lost.
+    local pull_out pull_rc=0
+    pull_out="$(VIBE_HOST="$admin_host" docker compose \
         --project-name vibe-admin \
         --env-file "$env_path" \
         -f "$VIBE_PREFIX/apps/admin/docker-compose.yml" \
         -f "$VIBE_PREFIX/apps/admin/docker-compose.grouped.yml" \
-        pull --quiet 2>/dev/null; then
-        warn "admin: image pull failed (offline? rate-limited?) — will keep going with a cached image if any"
+        pull --quiet 2>&1)" || pull_rc=$?
+
+    local pull_denied=0
+    if [ "$pull_rc" -ne 0 ]; then
+        printf '%s\n' "$pull_out" >&2
+        if printf '%s' "$pull_out" | grep -qiE 'denied|unauthorized|not found|manifest unknown'; then
+            pull_denied=1
+            warn "admin: image pull was DENIED by GHCR — the upstream image is not"
+            warn "       published yet (or the package is private). The admin web UI"
+            warn "       will not be reachable until that's fixed. CLI works fine."
+            warn "       Verify with: docker pull ghcr.io/kisaesdevlab/vibe-admin:latest"
+        else
+            warn "admin: image pull failed (see error above) — will try a cached image if any"
+        fi
     fi
-    if ! VIBE_HOST="$VIBE_HOST_PICK" docker compose \
+
+    if ! VIBE_HOST="$admin_host" docker compose \
         --project-name vibe-admin \
         --env-file "$env_path" \
         -f "$VIBE_PREFIX/apps/admin/docker-compose.yml" \
         -f "$VIBE_PREFIX/apps/admin/docker-compose.grouped.yml" \
         up -d --remove-orphans; then
-        warn "admin: failed to start — run 'sudo vibe doctor' and check 'docker logs vibe-admin-admin-1'"
+        if [ "$pull_denied" -eq 1 ]; then
+            warn "admin: stack failed to start because the image isn't available."
+            warn "       This is the same root cause as the pull failure above —"
+            warn "       not a docker logs issue. Skipping logs hint."
+        else
+            warn "admin: failed to start — run 'sudo vibe doctor' and check 'docker logs vibe-admin-admin-1'"
+        fi
+        # Mark the failure so print_next_steps + the install summary tell
+        # the operator the truth instead of pointing them at a 404.
+        ADMIN_STACK_FAILED=1
         return 0
     fi
 
@@ -633,7 +699,48 @@ ensure_admin() {
     # the Caddyfile. ingress_render_caddyfile pulls in apps/admin/
     # caddy.fragment automatically (see lib/ingress.sh).
     "$VIBE_PREFIX/bin/vibe" mode multi >/dev/null 2>&1 || true
-    ok "admin: stack up (https://${VIBE_HOST_PICK:-$(grep -E '^host=' "$VIBE_ETC/vibe.conf" | cut -d= -f2)}/admin/)"
+    ok "admin: stack up (https://${admin_host}/admin/)"
+}
+
+# ---------- Post-install sanity check ----------
+# Cheap end-of-bootstrap audit. Prevents a silently-half-baked state
+# from slipping past us into print_next_steps. If any of these fail
+# the operator gets a precise pointer instead of having to discover
+# it via `vibe status` returning "no vibe configuration found" half
+# an hour later.
+verify_install() {
+    log "verifying install state..."
+    local errs=0
+
+    [ -f "$VIBE_ETC/vibe.conf" ] || { err "missing $VIBE_ETC/vibe.conf"; errs=$((errs+1)); }
+    [ -L /usr/local/bin/vibe ]   || { err "missing symlink /usr/local/bin/vibe"; errs=$((errs+1)); }
+    if ! docker network inspect "$VIBE_NETWORK" >/dev/null 2>&1; then
+        err "missing docker network $VIBE_NETWORK"; errs=$((errs+1))
+    fi
+    if ! docker ps --filter 'name=^vibe-ingress-caddy$' --format '{{.Names}}' \
+         | grep -qx vibe-ingress-caddy; then
+        err "ingress container vibe-ingress-caddy is not running"; errs=$((errs+1))
+    fi
+    [ -f "$VIBE_ETC/admin/.env" ] || { err "missing $VIBE_ETC/admin/.env"; errs=$((errs+1)); }
+    # Admin container can take a few seconds for postgres init + node boot
+    # after `up -d` returns. Poll briefly before giving up.
+    local deadline=$(( $(date +%s) + 30 )) admin_up=0
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if docker ps --filter 'name=^vibe-admin-admin-1$' --format '{{.Names}}' \
+           | grep -qx vibe-admin-admin-1; then
+            admin_up=1
+            break
+        fi
+        sleep 2
+    done
+    [ "$admin_up" -eq 1 ] || { err "admin container vibe-admin-admin-1 is not running"; errs=$((errs+1)); }
+
+    if [ "$errs" -gt 0 ]; then
+        err "install did not reach a healthy state ($errs check(s) failed)"
+        err "run 'sudo vibe doctor' for a more detailed diagnostic"
+        die "aborting before next-steps — fix the above and re-run install.sh"
+    fi
+    ok "install verified"
 }
 
 # ---------- Done ----------
@@ -708,14 +815,24 @@ EOM
 EOM
     fi
 
-    cat <<EOM
+    if [ "${ADMIN_STACK_FAILED:-0}" = "1" ]; then
+        cat <<EOM
+  ${_YEL}The admin web app is NOT reachable yet.${_R}
+
+  The admin image (ghcr.io/kisaesdevlab/vibe-admin) couldn't be pulled —
+  see the [warn] lines above for the exact registry error. Until the
+  image is published (or made accessible to this host), use the CLI:
+
+EOM
+    else
+        cat <<EOM
   Manage this appliance from your browser:
 
     URL:       ${host_scheme}://${host}/admin/
     Username:  admin
 EOM
-    if [ -n "$ADMIN_INITIAL_PASSWORD" ]; then
-        cat <<EOM
+        if [ -n "$ADMIN_INITIAL_PASSWORD" ]; then
+            cat <<EOM
     Password:  ${ADMIN_INITIAL_PASSWORD}
 
   ${_YEL}This password was generated by install.sh and is also saved at
@@ -724,12 +841,13 @@ EOM
   automatically once you do.${_R}
 
 EOM
-    else
-        cat <<EOM
+        else
+            cat <<EOM
     Password:  see ${VIBE_LOG}/admin-initial-password.txt on this host
                (or run 'sudo cat ${VIBE_LOG}/admin-initial-password.txt')
 
 EOM
+        fi
     fi
     cat <<EOM
   Or install + manage apps from the command line:
@@ -774,6 +892,7 @@ main() {
     ensure_ingress
     ensure_vibed
     ensure_admin
+    verify_install
     print_next_steps
 }
 

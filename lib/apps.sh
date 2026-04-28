@@ -473,10 +473,20 @@ apps_install_payroll() {
     fi
 
     apps_ensure_datadirs payroll
-    install -d -m 0700 -o "$VIBE_USER" -g "$VIBE_USER" \
-        "${VIBE_DATA}/payroll/wal-archive" \
-        "${VIBE_DATA}/payroll/update-control" \
-        2>/dev/null || true
+    # wal-archive is bind-mounted into the postgres container at
+    # /wal-archive. The postgres `archive_command` runs as uid 70 inside
+    # the container and writes WAL segments to that path — so the host
+    # dir MUST be writable by uid 70, not by `vibe` (which is a system
+    # uid that postgres has no membership in). With vibe-only ownership
+    # the archive_command silently fails on every WAL segment and PITR
+    # is dead in the water.
+    install -d -m 0750 "${VIBE_DATA}/payroll/wal-archive"
+    chown 70:70 "${VIBE_DATA}/payroll/wal-archive" 2>/dev/null || true
+    # update-control is the api-container ↔ host bridge for self-service
+    # updates. The api runs as uid 1000 (node:20-alpine's `node` user)
+    # which writes the request file the host's update.sh consumes.
+    install -d -m 0750 "${VIBE_DATA}/payroll/update-control"
+    chown 1000:1000 "${VIBE_DATA}/payroll/update-control" 2>/dev/null || true
 
     local out tpl
     out="$(secrets_env_path payroll)"
@@ -753,16 +763,26 @@ apps_post_install_hint() {
 # ---------- Status ----------
 # Lightweight per-app status used by `vibe status` (PR2 prints a one-liner).
 apps_version_key() {
-    # Per-app env-var name carrying the GHCR tag pin.
+    # The env-var name the vendored compose actually reads to choose the
+    # GHCR tag — must match the `${VAR:-latest}` in the compose's `image:`
+    # lines, NOT the install-time placeholder name. Mismatches mean
+    # `vibe upgrade <app> --to X` writes a key the compose ignores and
+    # the upgrade silently does nothing.
     case "$1" in
+        # mybooks: image: ...:${VIBE_MYBOOKS_VERSION:-latest}
         mybooks) printf 'VIBE_MYBOOKS_VERSION\n' ;;
+        # connect: image: ...:${VERSION:-latest}
         connect) printf 'VERSION\n' ;;
-        tb)      printf 'VIBE_TB_VERSION\n' ;;
-        payroll) printf 'VIBE_PAYROLL_VERSION\n' ;;
-        # tax-chat's compose pins both api + web off the same IMAGE_TAG
-        # env var. We expose VIBE_TAX_VERSION as the operator-friendly
-        # name and the apps_install_tax renderer maps it onto IMAGE_TAG.
+        # tb: image: ...:${IMAGE_TAG:-latest}. The env.template renders
+        # `IMAGE_TAG=@VIBE_TB_VERSION@` so VIBE_TB_VERSION is only the
+        # install-time placeholder; runtime read-key is IMAGE_TAG.
+        tb)      printf 'IMAGE_TAG\n' ;;
+        # payroll: image: ...:${IMAGE_TAG:-latest}. Same shape as tb.
+        payroll) printf 'IMAGE_TAG\n' ;;
+        # tax: image: ...:${IMAGE_TAG:-latest}. We expose VIBE_TAX_VERSION
+        # as the operator-friendly install-time name; runtime is IMAGE_TAG.
         tax)     printf 'IMAGE_TAG\n' ;;
+        # admin: image: ...:${VERSION:-latest}
         admin)   printf 'VERSION\n' ;;
         *)       printf 'VERSION\n' ;;
     esac
