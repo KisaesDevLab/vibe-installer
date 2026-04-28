@@ -8,7 +8,7 @@
 # Main host block — all traffic terminates here, then routes by path
 # prefix into one of the installed apps.
 # =====================================================================
-{$VIBE_HOST} {
+@@SITE_HOSTS@@ {
 @@TLS_DIRECTIVE@@
 
     # ---- Landing page (no path prefix) -----------------------------

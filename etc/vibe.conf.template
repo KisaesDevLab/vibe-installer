@@ -14,6 +14,13 @@ mode=multi
 #   books.kispcal.com   — public FQDN with ACME
 host=vibe.local
 
+# LAN IPv4 fallback. Auto-detected by install.sh and added as a SAN to
+# the Caddy `tls internal` cert so Windows-only offices that can't
+# resolve `vibe.local` (no Bonjour) can hit https://<ip>/ without a
+# cert mismatch. Empty = the install couldn't detect an IP, or
+# tls_mode is acme/cf-tunnel where the SAN doesn't apply.
+host_ip=
+
 # TLS strategy:
 #   internal   — Caddy 'tls internal' + caddy trust on the host (LAN/mDNS)
 #   acme       — Caddy ACME HTTP-01 on :80 (public FQDN, A record required)

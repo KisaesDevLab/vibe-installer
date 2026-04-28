@@ -39,8 +39,9 @@ ingress_render_envfile() {
     ingress_ensure_dirs
     local env
     env="$(ingress_envfile_path)"
-    local host tls email
+    local host host_ip tls email
     host="$(config_get host)"
+    host_ip="$(config_get host_ip)"
     tls="$(config_get tls_mode)"
     # ACME contact email: vibe.conf (set by install.sh's intent prompts) is
     # the source of truth. Fall back to the legacy env-var precedence so
@@ -49,6 +50,9 @@ ingress_render_envfile() {
     [ -z "$email" ] && email="${VIBE_ACME_EMAIL:-${ACME_EMAIL:-}}"
     {
         printf 'VIBE_HOST=%s\n'       "${host:-vibe.local}"
+        # IP gets baked into the cert as a SAN (see ingress_render_caddyfile)
+        # so https://<ip>/ works alongside https://<host>/.
+        printf 'VIBE_HOST_IP=%s\n'    "${host_ip}"
         printf 'TLS_MODE=%s\n'        "${tls:-internal}"
         printf 'VIBE_PREFIX=%s\n'     "$VIBE_PREFIX"
         printf 'INGRESS_HTTP_PORT=%s\n'  "${INGRESS_HTTP_PORT:-80}"
@@ -68,10 +72,22 @@ ingress_render_caddyfile() {
     ingress_ensure_dirs
     [ -f "$INGRESS_TEMPLATE" ] || die "ingress template missing: $INGRESS_TEMPLATE"
 
-    local host tls
+    local host host_ip tls
     host="$(config_get host)"
+    host_ip="$(config_get host_ip)"
     tls="$(config_get tls_mode)"
     [ -n "$host" ] || die "host not set in $VIBE_CONF (rerun install.sh)"
+
+    # 0. Build the site host list: hostname only, OR `hostname, ip` so
+    #    Caddy mints an internal cert covering both. ACME and cf-tunnel
+    #    skip the IP — Let's Encrypt won't issue for an IP, and a
+    #    cf-tunnel target hostname is the only thing the tunnel routes
+    #    to anyway. The placeholder is replaced via awk; Caddy's own
+    #    {$VIBE_HOST} substitution still works for the hostname leg.
+    local site_hosts="{\$VIBE_HOST}"
+    if [ "$tls" = "internal" ] && [ -n "$host_ip" ]; then
+        site_hosts="{\$VIBE_HOST}, ${host_ip}"
+    fi
 
     # 1. Build the @@TLS_DIRECTIVE@@ + @@EMAIL_LINE@@ blocks.
     local tls_directive="" email_line=""
@@ -141,11 +157,12 @@ ingress_render_caddyfile() {
     # 4. Substitute placeholders.
     local out
     out="$(ingress_caddyfile_path)"
-    awk -v tls="$tls_directive" -v frags="$fragments" -v cfb="$cf_block" -v eml="$email_line" '
+    awk -v tls="$tls_directive" -v frags="$fragments" -v cfb="$cf_block" -v eml="$email_line" -v sh="$site_hosts" '
         { gsub(/@@TLS_DIRECTIVE@@/, tls);
           gsub(/@@APP_FRAGMENTS@@/, frags);
           gsub(/@@CF_TUNNEL_BLOCK@@/, cfb);
           gsub(/@@EMAIL_LINE@@/, eml);
+          gsub(/@@SITE_HOSTS@@/, sh);
           print }
     ' "$INGRESS_TEMPLATE" > "$out"
     chmod 0644 "$out"

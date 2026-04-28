@@ -428,7 +428,26 @@ EOM
 render_config() {
     local conf="$VIBE_ETC/vibe.conf"
     if [ -f "$conf" ]; then
-        ok "config $conf exists — leaving untouched"
+        # Existing config — only fill in host_ip if it's empty AND we
+        # detected one. Otherwise leave the operator's edits untouched.
+        local existing_ip
+        existing_ip="$(grep -E '^host_ip=' "$conf" 2>/dev/null | cut -d= -f2)"
+        if [ -z "$existing_ip" ]; then
+            local detected_ip
+            detected_ip="$(primary_ipv4 || true)"
+            if [ -n "$detected_ip" ]; then
+                if grep -q '^host_ip=' "$conf"; then
+                    sed -i "s|^host_ip=.*|host_ip=${detected_ip}|" "$conf"
+                else
+                    printf 'host_ip=%s\n' "$detected_ip" >> "$conf"
+                fi
+                ok "config $conf — added host_ip=${detected_ip} (was missing)"
+            else
+                ok "config $conf exists — leaving untouched"
+            fi
+        else
+            ok "config $conf exists — leaving untouched"
+        fi
         return 0
     fi
     log "rendering $conf..."
@@ -436,12 +455,21 @@ render_config() {
     prompt_tls_intent
     # Globals set above: VIBE_TLS_MODE_PICK, VIBE_HOST_PICK, VIBE_ACME_EMAIL_PICK
 
+    # Detect the appliance's primary LAN IPv4. Caddy will add this as a
+    # SAN to the `tls internal` cert so Windows-only offices that can't
+    # resolve vibe.local can still hit https://<ip>/ without
+    # ERR_SSL_PROTOCOL_ERROR. No-op for acme / cf-tunnel modes (the
+    # cert authority wouldn't issue for an IP anyway).
+    local host_ip=""
+    host_ip="$(primary_ipv4 || true)"
+
     install -m 0644 "$VIBE_PREFIX/etc/vibe.conf.template" "$conf"
     sed -i "s|^host=.*|host=${VIBE_HOST_PICK}|"          "$conf"
+    sed -i "s|^host_ip=.*|host_ip=${host_ip}|"           "$conf"
     sed -i "s|^tls_mode=.*|tls_mode=${VIBE_TLS_MODE_PICK}|" "$conf"
     sed -i "s|^acme_email=.*|acme_email=${VIBE_ACME_EMAIL_PICK}|" "$conf"
     chown "$VIBE_USER:$VIBE_USER" "$conf"
-    ok "wrote $conf (host=${VIBE_HOST_PICK}, tls_mode=${VIBE_TLS_MODE_PICK}, mode=multi)"
+    ok "wrote $conf (host=${VIBE_HOST_PICK}, host_ip=${host_ip:-<none>}, tls_mode=${VIBE_TLS_MODE_PICK}, mode=multi)"
 }
 
 # ---------- Bring up the Caddy ingress immediately ----------
