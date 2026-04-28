@@ -1,0 +1,53 @@
+# Caddy ingress — runs only in multi-app mode.
+#
+# Brought up by `lib/ingress.sh::ingress_up`. Joins the `vibe_ingress`
+# external network (created by install.sh); per-app stacks join the same
+# network when started with `-f docker-compose.grouped.yml`.
+#
+# Single ports binding for HTTP and HTTPS. ACME data and certificates
+# persist under /var/lib/vibe/ingress/ so a Caddy restart doesn't churn
+# Let's Encrypt rate limits.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: vibe-ingress-caddy
+    restart: unless-stopped
+    ports:
+      - '${INGRESS_HTTP_PORT:-80}:80'
+      - '${INGRESS_HTTPS_PORT:-443}:443'
+    environment:
+      VIBE_HOST: '${VIBE_HOST:-vibe.local}'
+      TLS_MODE: '${TLS_MODE:-internal}'
+      ACME_EMAIL: '${ACME_EMAIL:-}'
+    volumes:
+      # Caddyfile is rendered by lib/ingress.sh from Caddyfile.template +
+      # per-app fragments and bind-mounted in.
+      - /etc/vibe/ingress/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Static landing page served at https://<host>/ when the operator
+      # opens the appliance with no app prefix.
+      - ${VIBE_PREFIX:-/opt/vibe-installer}/ingress/landing:/srv/landing:ro
+      # ACME state. Caddy stores account keys + issued certs here so a
+      # restart picks them up rather than re-issuing.
+      - /var/lib/vibe/ingress/data:/data
+      - /var/lib/vibe/ingress/config:/config
+    networks:
+      - vibe_ingress
+    healthcheck:
+      # Caddy's admin API (off by default in our config) isn't available;
+      # the cheapest health probe is hitting the landing page.
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || wget -qO- http://127.0.0.1:80/_caddy_alive >/dev/null 2>&1 || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+networks:
+  vibe_ingress:
+    external: true

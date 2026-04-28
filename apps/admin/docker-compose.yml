@@ -1,0 +1,63 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/Vibe-Admin:infra/docker/docker-compose.prod.yml
+# Refresh with:
+#   cp ~/Projects/Vibe-Admin/infra/docker/docker-compose.prod.yml \
+#      ~/Projects/vibe-installer/apps/admin/docker-compose.yml
+# =====================================================================
+#
+# The admin app is the appliance's web management UI. It runs alongside
+# the four product apps as a 5th vendored stack. Unlike the products,
+# the admin app is installed automatically by `install.sh` (not via
+# `vibe install admin`) so the operator's first browser visit lands at
+# https://<host>/admin/ without an extra step.
+#
+# Single-app standalone (developer convenience):
+#   docker compose -f docker-compose.yml up -d   # admin at :4500
+#
+# Multi-app via the installer:
+#   layered with docker-compose.grouped.yml + the installer's Caddy
+#   ingress at :80/:443. SPA at https://<host>/admin/.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vibe-admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: vibe_admin
+    volumes:
+      - /var/lib/vibe/admin/postgres-data:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U vibe-admin']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  admin:
+    image: ghcr.io/kisaesdevlab/vibe-admin:${VERSION:-latest}
+    restart: unless-stopped
+    env_file:
+      - /etc/vibe/admin/.env
+    environment:
+      BASE_PATH: '${BASE_PATH:-/}'
+      SESSION_COOKIE_PATH: '${SESSION_COOKIE_PATH:-/}'
+      SESSION_SECURE: '${SESSION_SECURE:-false}'
+      TLS_MODE: '${TLS_MODE:-internal}'
+      BUILD_VERSION: '${VERSION:-dev}'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - '4500'
+    ports:
+      - '${ADMIN_PUBLISH_PORT:-4500}:4500'
+    volumes:
+      - /run/vibed.sock:/run/vibed.sock:rw
+      - /etc/vibe/admin/admin-bootstrap.password:/etc/vibe/admin/admin-bootstrap.password:rw
+
+secrets:
+  postgres_password:
+    file: /etc/vibe/admin/postgres_password

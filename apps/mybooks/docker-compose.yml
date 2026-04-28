@@ -1,0 +1,255 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/vibe-mybooks:docker-compose.prod.yml
+#   (post the runtime-base-path refactor — sentinel + entrypoint hook).
+# Refresh with:
+#   cp ~/Projects/myBooks/docker-compose.prod.yml \
+#      ~/Projects/vibe-installer/apps/mybooks/docker-compose.yml
+# =====================================================================
+#
+# vibe-distribution-plan §Compose file convention (Phase D5).
+#
+# Standalone production stack that pulls all three images from GHCR.
+# Replaces the previous single-image `app` model (which combined SPA
+# + API + worker into one container) with the three-image layout the
+# distribution plan settled on:
+#
+#   ghcr.io/kisaesdevlab/vibe-mybooks-api      (Express + workers)
+#   ghcr.io/kisaesdevlab/vibe-mybooks-web      (nginx + Vite-built SPA)
+#   ghcr.io/kisaesdevlab/vibe-mybooks-worker   (BullMQ runtime — same
+#                                                image as api with a
+#                                                different ENTRYPOINT)
+#
+# Worker shares the api image because they execute the same code base
+# (services/* + worker/index.ts). Tagging both with the same VERSION
+# keeps a deploy atomic — there is no scenario where the worker boots
+# fresh code while the api lags or vice versa.
+#
+# Usage (single-app appliance, against a tagged release):
+#   sudo mkdir -p /var/lib/vibe/mybooks/{postgres-data,redis-data,uploads,backups}
+#   echo "VIBE_MYBOOKS_VERSION=1.4" >> .env
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Usage (multi-app appliance, layered with the grouped overlay):
+#   docker network create vibe_ingress
+#   docker compose -f docker-compose.prod.yml \
+#                  -f docker-compose.grouped.yml up -d
+#
+# `${VIBE_MYBOOKS_VERSION:-latest}` defaults to `:latest`. Production
+# operators pin to a specific minor (e.g. `1.4`) so the rolling tag
+# never silently surfaces a breaking change mid-deploy. The installer
+# writes a pinned value into .env on first install (`vibe install`).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kisbooks}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env for production}
+      POSTGRES_DB: ${POSTGRES_DB:-kisbooks}
+    volumes:
+      # Absolute prod path (vibe-distribution-plan §Persistent volumes).
+      # Installer creates the dir + chowns to the postgres uid before
+      # the first `docker compose up`.
+      - /var/lib/vibe/mybooks/postgres-data:/var/lib/postgresql/data
+    ports:
+      # Keep host-port publish for direct psql access — useful for
+      # backup tooling and operator debugging. Localhost-only via the
+      # default Docker bind, which is fine on a single-tenant appliance.
+      - "${DB_HOST_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kisbooks}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    mem_limit: ${DB_MEM_LIMIT:-1g}
+    mem_reservation: 256m
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - /var/lib/vibe/mybooks/redis-data:/data
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    mem_limit: ${REDIS_MEM_LIMIT:-256m}
+    logging: *default-logging
+
+  api:
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-api:${VIBE_MYBOOKS_VERSION:-latest}
+    # `missing` lets a fresh install pull on first boot but doesn't
+    # silently re-fetch on every `up`. Operators run `... pull` before
+    # `up` when they want to upgrade — the installer's `vibe upgrade`
+    # does this explicitly.
+    pull_policy: missing
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3001}:3001"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kisbooks}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env for production}@db:5432/${POSTGRES_DB:-kisbooks}
+      REDIS_URL: redis://redis:6379
+      TAILSCALE_SOCKET_PATH: /var/run/tailscale/tailscaled.sock
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env (64 hex chars — `openssl rand -hex 32`). The installer mints one automatically.}
+      PLAID_ENCRYPTION_KEY: ${PLAID_ENCRYPTION_KEY:?PLAID_ENCRYPTION_KEY must be set in .env (64 hex chars — `openssl rand -hex 32`). Wraps all encrypted-at-rest data, not only Plaid.}
+    volumes:
+      - /var/lib/vibe/mybooks/uploads:/data/uploads:z
+      - /var/lib/vibe/mybooks/backups:/data/backups:z
+      - ts-socket:/var/run/tailscale:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    mem_limit: ${API_MEM_LIMIT:-1g}
+    mem_reservation: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+
+  web:
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-web:${VIBE_MYBOOKS_VERSION:-latest}
+    pull_policy: missing
+    restart: unless-stopped
+    environment:
+      # The web container's /docker-entrypoint.d/40-base-path.sh
+      # substitutes the build-time sentinel `/__VIBE_BASE_PATH__/` with
+      # this value before nginx starts. One image, every prefix:
+      #   single-app: VITE_BASE_PATH=/         (the default below)
+      #   multi-app : VITE_BASE_PATH=/mybooks/ (set by docker-compose.grouped.yml)
+      VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
+    ports:
+      - "${VITE_PORT:-5173}:5173"
+    depends_on:
+      - api
+    mem_limit: ${WEB_MEM_LIMIT:-128m}
+    logging: *default-logging
+
+  worker:
+    # Same image as api — bullmq + scheduler entrypoint live in the
+    # api package's tree and are baked into the same artifact at CI.
+    image: ghcr.io/kisaesdevlab/vibe-mybooks-api:${VIBE_MYBOOKS_VERSION:-latest}
+    pull_policy: missing
+    restart: unless-stopped
+    command: ["npx", "tsx", "packages/worker/src/index.ts"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kisbooks}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env for production}@db:5432/${POSTGRES_DB:-kisbooks}
+      REDIS_URL: redis://redis:6379
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY must be set in .env (64 hex chars — `openssl rand -hex 32`).}
+      PLAID_ENCRYPTION_KEY: ${PLAID_ENCRYPTION_KEY:?PLAID_ENCRYPTION_KEY must be set in .env (64 hex chars — `openssl rand -hex 32`).}
+    volumes:
+      - /var/lib/vibe/mybooks/uploads:/data/uploads:z
+      - /var/lib/vibe/mybooks/backups:/data/backups:z
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Worker is a long-running scheduler — without a healthcheck a
+    # silent crash leaves `docker compose ps` showing "Up" forever.
+    # The cheapest signal that the process is alive AND can talk
+    # to its dependencies is a Redis PING via the same network the
+    # advisory-lock loop uses. PING is ~sub-ms so a 30s interval
+    # is generous; failure flips the container to Unhealthy and
+    # `restart: unless-stopped` recreates it.
+    healthcheck:
+      # The worker's image (vibe-mybooks-api) doesn't ship redis-cli,
+      # but does ship busybox netcat — a TCP-port probe is enough to
+      # answer "process alive AND can route to redis service". Not
+      # as deep as a PING/PONG round-trip, but catches the most
+      # common failure mode (container running but DNS broken).
+      test: ["CMD-SHELL", "nc -z redis 6379"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: ${WORKER_MEM_LIMIT:-512m}
+    mem_reservation: 128m
+    logging: *default-logging
+
+  # Tailscale sidecar — same role as the dev compose. Joins the
+  # appliance to the firm's tailnet so super-admins can reach the
+  # API remotely without opening inbound router ports. Userspace
+  # networking keeps the container portable across distros.
+  tailscale:
+    image: tailscale/tailscale:v1.76.1
+    hostname: ${TS_HOSTNAME:-mybooks}
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_USERSPACE: "true"
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---ssh=false}
+    volumes:
+      - ts-state:/var/lib/tailscale
+      - ts-socket:/var/run/tailscale
+    mem_limit: ${TS_MEM_LIMIT:-128m}
+    logging: *default-logging
+
+  # GLM-OCR sidecar — same shape as the dev compose, gated behind
+  # --profile glm-ocr. Operators activate locally hosted OCR by
+  # bringing this up and pointing the API's GLM-OCR base URL at
+  # http://glm-ocr:8090 in the admin UI. The model cache lives in
+  # /var/lib/vibe/mybooks/glm-ocr-models so an appliance reboot
+  # does not re-download multi-GB GGUF weights.
+  glm-ocr:
+    image: ${GLM_OCR_IMAGE:-ghcr.io/kisaesdevlab/vibe-glm-ocr:latest}
+    pull_policy: missing
+    restart: unless-stopped
+    profiles: ["glm-ocr"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8090/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First boot on a fresh `/var/lib/vibe/mybooks/glm-ocr-models`
+      # volume pulls multi-GB GGUF weights and mmap-loads them —
+      # 60s is too tight. Configurable via GLM_OCR_START_PERIOD.
+      start_period: ${GLM_OCR_START_PERIOD:-180s}
+    mem_limit: ${GLM_OCR_MEM_LIMIT:-4g}
+    mem_reservation: 1g
+    volumes:
+      - /var/lib/vibe/mybooks/glm-ocr-models:/models
+    logging: *default-logging
+
+  # Cloudflare Tunnel sidecar — gated behind --profile tunnel. Same
+  # customer-owned-token model as the dev compose; never bundles
+  # Kisaes credentials. Opt in via `docker compose --profile tunnel up`.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:-}"]
+    depends_on:
+      - api
+    # Match the env-var name used in docker-compose.yml so operators
+    # who tuned this in their dev .env keep the same setting in prod.
+    mem_limit: ${CLOUDFLARED_MEM_LIMIT:-128m}
+    logging: *default-logging
+
+volumes:
+  # Tailscale state lives in named volumes — the installer doesn't
+  # need to surface these as host paths the way it does for postgres
+  # and uploads. Tailscale state regenerates if lost (operator just
+  # re-runs `tailscale up` with the existing TS_AUTHKEY).
+  ts-state:
+  ts-socket:

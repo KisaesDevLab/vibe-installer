@@ -1,0 +1,95 @@
+name: droplet-smoke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Installer ref to test (defaults to main)'
+        required: false
+        default: 'main'
+
+# Sequential — only one droplet at a time, so a lingering failure can be
+# triaged before the next run blows it away.
+concurrency:
+  group: droplet-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    # SECRETS REQUIRED in repo settings:
+    #   DIGITALOCEAN_TOKEN     DigitalOcean API token (write scope)
+    #   DROPLET_SSH_PUBKEY     SSH public key registered with DO
+    #   DROPLET_SSH_PRIVKEY    matching private key for ssh-action
+    #   VIBE_LICENSE_TOKEN_*   one per app under test (optional; trial fallback otherwise)
+    env:
+      VIBE_INSTALLER_REF: ${{ inputs.ref || github.sha }}
+      DROPLET_NAME: vibe-smoke-${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+
+      - name: Provision droplet (Ubuntu 24.04, 4 vCPU / 8 GB Premium Intel)
+        id: provision
+        run: |
+          set -euo pipefail
+          # Register the runner's pubkey so we can SSH in.
+          KEY_ID=$(doctl compute ssh-key import "${DROPLET_NAME}-key" \
+              --public-key "${{ secrets.DROPLET_SSH_PUBKEY }}" \
+              --format ID --no-header)
+          echo "ssh_key_id=$KEY_ID" >> "$GITHUB_OUTPUT"
+
+          IP=$(doctl compute droplet create "$DROPLET_NAME" \
+              --image ubuntu-24-04-x64 \
+              --region nyc3 \
+              --size s-4vcpu-8gb-intel \
+              --ssh-keys "$KEY_ID" \
+              --wait \
+              --format PublicIPv4 --no-header)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        run: |
+          for i in {1..30}; do
+            if nc -z -w 5 ${{ steps.provision.outputs.ip }} 22 2>/dev/null; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Run smoke test on droplet
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ steps.provision.outputs.ip }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_PRIVKEY }}
+          envs: VIBE_INSTALLER_REF
+          command_timeout: 45m
+          script: |
+            set -euo pipefail
+            export VIBE_HOST=${{ steps.provision.outputs.ip }}.nip.io
+            export VIBE_TLS_MODE=internal
+            export VIBE_INSTALLER_REF="$VIBE_INSTALLER_REF"
+            export VIBE_LICENSE_TOKEN_MYBOOKS='${{ secrets.VIBE_LICENSE_TOKEN_MYBOOKS }}'
+            export VIBE_LICENSE_TOKEN_CONNECT='${{ secrets.VIBE_LICENSE_TOKEN_CONNECT }}'
+            export VIBE_LICENSE_TOKEN_TB='${{ secrets.VIBE_LICENSE_TOKEN_TB }}'
+            curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${VIBE_INSTALLER_REF}/tests/smoke.sh" \
+                -o /tmp/smoke.sh
+            chmod +x /tmp/smoke.sh
+            /tmp/smoke.sh
+
+      - name: Tear down droplet
+        if: always()
+        run: |
+          doctl compute droplet delete "$DROPLET_NAME" --force || true
+          if [ -n "${{ steps.provision.outputs.ssh_key_id }}" ]; then
+            doctl compute ssh-key delete "${{ steps.provision.outputs.ssh_key_id }}" --force || true
+          fi

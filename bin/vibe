@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# vibe — CLI for managing the Vibe appliance.
+#
+# Subcommands implemented in PR1: status, doctor, mode, version, help.
+# Subcommands stubbed for later PRs: install, uninstall, upgrade, logs, exec,
+# backup, license, cloudflare, rotate-secrets, upgrade-check.
+#
+# Source-of-truth helpers live in /opt/vibe-installer/lib/*.sh.
+
+set -euo pipefail
+
+VIBE_PREFIX_DEFAULT="/opt/vibe-installer"
+VIBE_PREFIX="${VIBE_PREFIX:-$VIBE_PREFIX_DEFAULT}"
+
+if [ ! -d "$VIBE_PREFIX" ]; then
+    printf '[vibe] vibe-installer not found at %s — run install.sh\n' "$VIBE_PREFIX" >&2
+    exit 1
+fi
+
+# shellcheck source=lib/common.sh
+. "$VIBE_PREFIX/lib/common.sh"
+# shellcheck source=lib/config.sh
+. "$VIBE_PREFIX/lib/config.sh"
+# shellcheck source=lib/checks.sh
+. "$VIBE_PREFIX/lib/checks.sh"
+# shellcheck source=lib/secrets.sh
+. "$VIBE_PREFIX/lib/secrets.sh"
+# shellcheck source=lib/license.sh
+. "$VIBE_PREFIX/lib/license.sh"
+# shellcheck source=lib/ingress.sh
+. "$VIBE_PREFIX/lib/ingress.sh"
+# shellcheck source=lib/apps.sh
+. "$VIBE_PREFIX/lib/apps.sh"
+# shellcheck source=lib/mode.sh
+. "$VIBE_PREFIX/lib/mode.sh"
+# shellcheck source=lib/cloudflare.sh
+. "$VIBE_PREFIX/lib/cloudflare.sh"
+# shellcheck source=lib/glm_ocr.sh
+. "$VIBE_PREFIX/lib/glm_ocr.sh"
+# shellcheck source=lib/tailscale.sh
+. "$VIBE_PREFIX/lib/tailscale.sh"
+# shellcheck source=lib/tools.sh
+. "$VIBE_PREFIX/lib/tools.sh"
+# shellcheck source=lib/update_check.sh
+. "$VIBE_PREFIX/lib/update_check.sh"
+
+VIBE_VERSION="0.1.0-dev"
+
+# Auto-migrate legacy mode=single configs at every root invocation. Without
+# root we can't bring containers up, so we skip silently (the operator's
+# next `sudo vibe ...` triggers the real migration). The function itself
+# is idempotent — returns immediately when mode is already multi or the
+# config file doesn't exist yet.
+if [ "$(id -u)" -eq 0 ]; then
+    mode_migrate_to_always_multi || true
+fi
+
+usage() {
+    cat <<EOF
+vibe — Vibe appliance manager (v${VIBE_VERSION})
+
+Usage:
+  vibe <command> [args]
+
+Inspection:
+  status                    Show installed apps, versions, mode.
+  doctor                    Run host + container health checks.
+  mode [single|multi]       Print or force the install mode.
+  version                   Print vibe-installer version.
+
+Lifecycle:
+  install <app> [opts]      Install a Vibe app or integration:
+                              apps:         mybooks  connect  tb  payroll  tax
+                              integrations: glm-ocr  tailscale  tools
+                            opts: --cloudflare-tunnel <token>
+                                  (apps only; cf-tunnel)
+  uninstall <app>           Stop & archive an app's data.
+  uninstall --all           Tear down everything (with confirmation).
+  upgrade <app> [--to VER]  Pull a new image tag and migrate.
+  upgrade-check             List newer GHCR tags (read-only — never auto-applies).
+
+Operational:
+  logs <app> [service]      Tail container logs.
+  exec <app> <svc> <cmd>    Run a command inside a container.
+  backup <app>              Snapshot the app's host-bind data + env.
+  restore <app> <tarball>   Restore from a previous backup tarball.
+
+Auth & secrets:
+  license set <app> <token>          Replace an app's license token.
+  cloudflare attach <app> --token T  Activate Cloudflare Tunnel sidecar.
+  cloudflare detach <app>            Stop the sidecar, clear the token.
+  cloudflare status [<app>]          Show attached/detached state.
+  rotate-secrets <app>               Rotate non-license secrets.     (v1.1)
+
+Environment overrides:
+  VIBE_PREFIX        installer location          (default: $VIBE_PREFIX_DEFAULT)
+  VIBE_ASSUME_YES=1  skip all confirmation prompts
+  VIBE_DEBUG=1       enable verbose logging
+EOF
+}
+
+# ---------- Commands implemented in PR1 ----------
+
+cmd_version() {
+    printf '%s\n' "$VIBE_VERSION"
+}
+
+cmd_status() {
+    if [ ! -f "$VIBE_CONF" ]; then
+        warn "no vibe configuration found at $VIBE_CONF"
+        warn "run install.sh first."
+        return 1
+    fi
+    log "vibe-installer ${VIBE_VERSION}"
+    echo
+    config_dump
+    echo
+    local count; count="$(config_installed_count)"
+    if [ "$count" -eq 0 ]; then
+        log "no apps installed"
+    else
+        log "installed apps:"
+        local app
+        while IFS= read -r app; do
+            apps_status_line "$app"
+        done < <(config_installed_list)
+    fi
+}
+
+cmd_doctor() {
+    log "running host & container checks..."
+    if checks_run_all; then
+        ok "all required checks passed"
+        return 0
+    else
+        err "one or more checks failed"
+        return 1
+    fi
+}
+
+cmd_mode() {
+    case "${1:-}" in
+        "")
+            local m; m="$(config_get mode)"
+            printf '%s\n' "${m:-unknown}"
+            ;;
+        single|multi)
+            require_root
+            with_lock mode_force "$1"
+            ;;
+        *) die "usage: vibe mode [single|multi]" ;;
+    esac
+}
+
+# ---------- Lifecycle commands ----------
+
+cmd_install() {
+    require_root
+    [ $# -ge 1 ] || die "usage: vibe install <app> [opts]"
+    with_lock apps_install "$@"
+}
+
+cmd_license() {
+    case "${1:-}" in
+        set)
+            shift
+            require_root
+            [ $# -ge 2 ] || die "usage: vibe license set <app> <token>"
+            license_set "$1" "$2"
+            ;;
+        "") err "usage: vibe license set <app> <token>"; return 64 ;;
+        *)  err "unknown license subcommand: $1"; return 64 ;;
+    esac
+}
+
+cmd_uninstall() {
+    require_root
+    [ $# -ge 1 ] || die "usage: vibe uninstall <app>  |  vibe uninstall --all"
+    with_lock apps_uninstall "$@"
+}
+
+cmd_upgrade() {
+    require_root
+    [ $# -ge 1 ] || die "usage: vibe upgrade <app> [--to <version>]"
+    with_lock apps_upgrade "$@"
+}
+
+cmd_logs() {
+    [ $# -ge 1 ] || die "usage: vibe logs <app> [service]"
+    apps_logs "$@"
+}
+
+cmd_exec() {
+    [ $# -ge 3 ] || die "usage: vibe exec <app> <service> <cmd> [args...]"
+    apps_exec "$@"
+}
+
+cmd_backup() {
+    require_root
+    [ $# -ge 1 ] || die "usage: vibe backup <app>"
+    with_lock apps_backup "$@"
+}
+
+cmd_restore() {
+    require_root
+    [ $# -ge 2 ] || die "usage: vibe restore <app> <tarball-path>"
+    with_lock apps_restore "$@"
+}
+
+cmd_cloudflare() {
+    case "${1:-}" in
+        attach)  shift; cloudflare_attach "$@" ;;
+        detach)  shift; cloudflare_detach "$@" ;;
+        status)  shift; cloudflare_status "$@" ;;
+        ""|help) printf 'usage: vibe cloudflare {attach|detach|status} <app> [--token T]\n' ;;
+        *) err "unknown cloudflare subcommand: $1"; return 64 ;;
+    esac
+}
+
+cmd_upgrade_check() {
+    # `--json` switches to a structured emitter consumed by vibed's
+    # handleAppsUpgradeCheck (which is in turn consumed by the admin
+    # web app's update poller). The default human-readable output is
+    # unchanged for terminal users.
+    if [ "${1:-}" = "--json" ]; then
+        update_check_run_json
+        return 0
+    fi
+    log "checking GHCR for newer releases of installed apps..."
+    update_check_run
+    echo
+    log "no changes were applied. To upgrade an app, run:"
+    log "  sudo vibe upgrade <app> [--to <version>]"
+}
+
+# ---------- Stubs for later PRs ----------
+
+cmd_unimplemented() {
+    local cmd="$1"; shift
+    err "command '$cmd' is not implemented yet (lands in a later PR)"
+    err "ran with args: $*"
+    return 2
+}
+
+# ---------- Dispatch ----------
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        help|-h|--help)        usage ;;
+        version|-v|--version)  cmd_version ;;
+        status)                cmd_status "$@" ;;
+        doctor)                cmd_doctor "$@" ;;
+        mode)                  cmd_mode "$@" ;;
+        install)               cmd_install "$@" ;;
+        uninstall)             cmd_uninstall "$@" ;;
+        upgrade)               cmd_upgrade "$@" ;;
+        logs)                  cmd_logs "$@" ;;
+        exec)                  cmd_exec "$@" ;;
+        backup)                cmd_backup "$@" ;;
+        restore)               cmd_restore "$@" ;;
+        license)               cmd_license "$@" ;;
+        cloudflare)            cmd_cloudflare "$@" ;;
+        upgrade-check)         cmd_upgrade_check "$@" ;;
+        # Future:
+        rotate-secrets)
+            cmd_unimplemented "$cmd" "$@"
+            ;;
+        *) err "unknown command: $cmd"; echo; usage; return 64 ;;
+    esac
+}
+
+main "$@"

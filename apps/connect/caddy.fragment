@@ -1,0 +1,28 @@
+# Vibe Connect — Caddy route fragment (rendered into Caddyfile in multi-app mode).
+#
+# Connect's nginx container handles all SPA + portal + API routing; Caddy's
+# job at /connect/* is to terminate TLS, strip the prefix, and forward to
+# nginx. The nginx upstream is configured (via BASE_PATH=/connect in the
+# grouped overlay) to expect requests prefixed with /connect, so we forward
+# unchanged.
+#
+# Container hostname comes from `--project-name vibe-connect` + the service
+# name in docker-compose.yml.
+
+handle /connect/health {
+    rewrite * /health
+    reverse_proxy vibe-connect-app-1:4000
+}
+
+handle_path /connect/* {
+    # Forward with the prefix intact — Connect's nginx + SPA know about
+    # BASE_PATH=/connect.
+    rewrite * /connect{uri}
+    reverse_proxy vibe-connect-nginx-1:80
+}
+
+# Bare /connect (no trailing slash) — redirect to /connect/ so the SPA
+# loads its index.html instead of falling through to the landing page.
+handle /connect {
+    redir /connect/ permanent
+}

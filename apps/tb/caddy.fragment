@@ -1,0 +1,101 @@
+# Vibe TB — Caddy route fragment.
+#
+# Routing model: Caddy strips /tb/ before forwarding so the upstream web
+# nginx stays mode-agnostic (it only knows about unprefixed /api/, /sw.js,
+# /index.html, etc.). The web image's runtime base-path substitution
+# handles the SPA bundle's URLs — /tb/assets/... in the browser, /assets/
+# upstream after the strip.
+#
+# API special-cases. The upstream web nginx (deploy/nginx-docker.conf)
+# overrides timeouts and body-size limits for backup / restore / import /
+# support-chat. In multi-app mode the API is reached through Caddy
+# directly (bypassing web's nginx entirely), so the same overrides have
+# to live here too. Keep the two in sync — see deploy/nginx-docker.conf
+# in the trial-balance-app repo.
+
+handle /tb/health {
+    rewrite * /api/v1/health
+    reverse_proxy vibe-tb-api-1:3001
+}
+
+# Backup / restore: 500 MB body cap, 10-minute timeouts. .tbak archives
+# routinely run several hundred MB.
+handle_path /tb/api/v1/backup/* {
+    rewrite * /api/v1/backup{uri}
+    request_body {
+        max_size 500MB
+    }
+    reverse_proxy vibe-tb-api-1:3001 {
+        transport http {
+            read_timeout 10m
+            write_timeout 10m
+        }
+    }
+}
+handle_path /tb/api/v1/restore/* {
+    rewrite * /api/v1/restore{uri}
+    request_body {
+        max_size 500MB
+    }
+    reverse_proxy vibe-tb-api-1:3001 {
+        transport http {
+            read_timeout 10m
+            write_timeout 10m
+        }
+    }
+}
+
+# OCR / vision pipeline: longer ceiling (multi-page PDFs).
+handle_path /tb/api/v1/import/* {
+    rewrite * /api/v1/import{uri}
+    request_body {
+        max_size 50MB
+    }
+    reverse_proxy vibe-tb-api-1:3001 {
+        transport http {
+            read_timeout 30m
+            write_timeout 30m
+        }
+    }
+}
+
+# Support chat: SSE. flush_interval -1 disables Caddy's response buffer
+# so every chunk reaches the browser as the model emits it.
+handle /tb/api/v1/support/chat {
+    rewrite * /api/v1/support/chat
+    reverse_proxy vibe-tb-api-1:3001 {
+        flush_interval -1
+        transport http {
+            read_timeout 10m
+            write_timeout 10m
+        }
+    }
+}
+
+# General API: /tb/api/v1/foo → /api/v1/foo → api:3001.
+handle_path /tb/api/* {
+    rewrite * /api{uri}
+    reverse_proxy vibe-tb-api-1:3001
+}
+
+# MCP — also SSE, longer timeout.
+handle_path /tb/mcp/* {
+    rewrite * /mcp{uri}
+    reverse_proxy vibe-tb-api-1:3001 {
+        flush_interval -1
+        transport http {
+            read_timeout 1h
+            write_timeout 1h
+        }
+    }
+}
+
+# SPA + static assets. Caddy strips /tb/ → web nginx serves /assets/...,
+# /index.html, /sw.js from disk.
+handle_path /tb/* {
+    reverse_proxy vibe-tb-web-1:80
+}
+
+handle /tb {
+    redir /tb/ permanent
+}

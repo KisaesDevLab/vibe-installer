@@ -1,0 +1,26 @@
+# =====================================================================
+# Multi-app overlay (installer-owned) for Vibe Admin.
+#
+# Layered on top of apps/admin/docker-compose.yml when the installer is
+# in multi-app mode. Drops the host-port publish, joins the admin
+# container to the external `vibe_ingress` network, and sets BASE_PATH=
+# /admin so the SPA + session cookie scope match the Caddy ingress
+# routing.
+# =====================================================================
+
+services:
+  admin:
+    ports: !reset []
+    networks:
+      - default
+      - vibe_ingress
+    environment:
+      BASE_PATH: '/admin'
+      SESSION_COOKIE_PATH: '/admin'
+      SESSION_SECURE: 'true'
+      TLS_MODE: 'external'
+      SITE_URL: 'https://${VIBE_HOST:-vibe.local}/admin'
+
+networks:
+  vibe_ingress:
+    external: true

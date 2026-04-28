@@ -1,0 +1,41 @@
+name: shellcheck
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'uninstall.sh'
+      - 'bin/**'
+      - 'lib/**'
+      - 'tests/**.sh'
+      - '.github/workflows/shellcheck.yml'
+  push:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Lint shell scripts
+        run: |
+          set -e
+          # Top-level scripts
+          shellcheck -x install.sh
+          [ -f uninstall.sh ] && shellcheck -x uninstall.sh
+          # CLI dispatcher
+          shellcheck -x bin/vibe
+          # Libraries (sourced — disable SC1091 follow-source warnings)
+          for f in lib/*.sh; do
+            [ -f "$f" ] || continue
+            shellcheck -x -e SC1091 "$f"
+          done
+          # Test scripts
+          for f in tests/*.sh; do
+            [ -f "$f" ] || continue
+            shellcheck -x -e SC1091 "$f"
+          done

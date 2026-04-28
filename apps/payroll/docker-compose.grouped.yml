@@ -1,0 +1,52 @@
+# =====================================================================
+# Multi-app overlay (installer-owned) for Vibe Payroll Time.
+#
+# Layered on top of apps/payroll/docker-compose.yml when the host is in
+# multi-app mode. Two responsibilities:
+#
+#   1. Disable Payroll's bundled Caddy + cloudflared + tailscale sidecars.
+#      The shared vibe-installer Caddy ingress at https://<host>/ owns
+#      :80/:443; Payroll's per-app Caddy would collide.
+#   2. Join the api + web containers to the external `vibe_ingress` network
+#      so the shared ingress can reach them by container hostname.
+#
+# Distinct from upstream Vibe-Payroll-Time/docker-compose.grouped.yml,
+# which is the source-build dev overlay — it expects to layer on the dev
+# compose, not prod, and rebuilds the api+web images from source.
+# =====================================================================
+
+services:
+  api:
+    environment:
+      CORS_ORIGIN: https://${VIBE_HOST:?Set VIBE_HOST for multi-app mode}
+      COOKIE_PATH: /payroll
+      COOKIE_SECURE: 'true'
+    networks:
+      - internal
+      - vibe_ingress
+
+  web:
+    environment:
+      # Runtime base-path substitution — the web container's
+      # /docker-entrypoint.d/40-base-path.sh hook reads this value at
+      # startup and rewrites `/__VIBE_BASE_PATH__/` across html/js/css/
+      # json/map/webmanifest before nginx starts. One image, two modes,
+      # no rebuild. (Replaces the pre-2026-04 build-arg pattern that
+      # baked the prefix into the bundle at image build time and forced
+      # separate single-app and multi-app images.)
+      VITE_BASE_PATH: /payroll/
+    networks:
+      - internal
+      - vibe_ingress
+
+  # Disable Payroll's bundled Caddy. We can't remove a service from an
+  # overlay outright; setting `profiles` to a non-default name takes the
+  # service out of the active set unless the operator explicitly opts in.
+  caddy:
+    profiles: ['unused']
+
+networks:
+  internal:
+    driver: bridge
+  vibe_ingress:
+    external: true

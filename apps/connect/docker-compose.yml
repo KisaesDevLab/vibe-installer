@@ -1,0 +1,121 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/vibe-connect:infra/docker/docker-compose.prod.yml
+#   upstream commit: 0ae42f9fe595baf7ee30ac37dab8b6fc9a877af8 (2026-04-24)
+# Refresh with:
+#   cp ~/Projects/Vibe-Connect/infra/docker/docker-compose.prod.yml \
+#      ~/Projects/vibe-installer/apps/connect/docker-compose.yml
+# NOTE: The `nginx` service stays here pending upstream prereq P-B (drop
+# vibe-connect-nginx, route directly through Caddy). Until then the
+# installer's Caddy ingress proxies /connect/* through this nginx.
+# =====================================================================
+#
+# Production / installer-rendered Compose. Vendored verbatim by the
+# `vibe-installer` repo into `apps/connect/docker-compose.yml` and layered
+# with installer overrides for ingress, secrets, and host paths.
+#
+# The same image runs in both single-app and multi-app modes — flip the
+# distribution-mode env knobs (`BASE_PATH`, `SESSION_COOKIE_PATH`,
+# `TLS_MODE`, `APP_PUBLISH_PORT`, `NGINX_PUBLISH_PORT_*`) at deploy time;
+# see `vibe-distribution-plan.md` and `.env.example` for the full table.
+#
+# Image references pin to GHCR. Operators set VERSION (e.g. VERSION=1.4.2)
+# in `/etc/vibe/connect/.env`; defaults to `:latest` for first-time installs
+# that haven't yet pinned to a release tag.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vibe
+      # Operator drops the password into a 0600 file at this host path; the
+      # installer creates it at install time. Avoids the inlined-in-DATABASE_URL
+      # antipattern (env vars leak via `docker inspect` / process listings).
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: vibe_connect
+    ports:
+      # Bound to localhost only so the operator's psql can reach it for
+      # debugging. The installer's `vibe doctor` and backup tooling go through
+      # this socket; direct LAN exposure is never exposed.
+      - '127.0.0.1:${POSTGRES_PUBLISH_PORT:-5435}:5432'
+    volumes:
+      - /var/lib/vibe/connect/postgres-data:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U vibe']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 4g
+    mem_reservation: 512m
+    cpus: 2
+
+  app:
+    image: ghcr.io/kisaesdevlab/vibe-connect-app:${VERSION:-latest}
+    restart: unless-stopped
+    env_file:
+      - /etc/vibe/connect/.env
+    environment:
+      # Distribution-mode knobs. Each is overridable in /etc/vibe/connect/.env;
+      # defaults match the single-app shape so a `vibe install connect` on an
+      # otherwise-empty host produces a working appliance immediately.
+      BASE_PATH: '${BASE_PATH:-/}'
+      SESSION_COOKIE_PATH: '${SESSION_COOKIE_PATH:-/}'
+      TLS_MODE: '${TLS_MODE:-internal}'
+      BUILD_VERSION: '${VERSION:-dev}'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - '4000'
+    ports:
+      # Single-app: publish so curl localhost:4000/health works during
+      # bringup. The installer's grouped overlay clears this with
+      # `!reset []` and routes traffic through Caddy on the vibe_ingress
+      # network instead.
+      - '${APP_PUBLISH_PORT:-4000}:4000'
+    volumes:
+      - /var/lib/vibe/connect/uploads:/var/lib/vibe/connect/uploads
+      # In-app ACME ticker drops new certs here; nginx reads from the same
+      # host path read-only. Matches the Dockerfile's TLS_OUTPUT_DIR env so
+      # the writes land in the bind-mount, not the container's ephemeral
+      # writable layer.
+      - /var/lib/vibe/connect/tls:/var/lib/vibe/connect/tls
+    mem_limit: 2g
+    mem_reservation: 512m
+    cpus: 2
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:4000/health || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  nginx:
+    image: ghcr.io/kisaesdevlab/vibe-connect-nginx:${VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      BASE_PATH: '${BASE_PATH:-/}'
+      TLS_MODE: '${TLS_MODE:-internal}'
+      HTTP_PORT: '80'
+      HTTPS_PORT: '443'
+      PORTAL_HTTPS_PORT: '8443'
+    ports:
+      - '${NGINX_PUBLISH_PORT_HTTP:-80}:80'
+      - '${NGINX_PUBLISH_PORT_HTTPS:-443}:443'
+      - '${NGINX_PUBLISH_PORT_PORTAL:-8443}:8443'
+    volumes:
+      # nginx reads certs the app's tlsAcme service drops here. Read-only —
+      # nginx never writes back. Empty in TLS_MODE=external (Caddy
+      # terminates upstream) but the mount stays so a flip back to
+      # internal mode works without a compose recreate. The host source
+      # matches the app's TLS_OUTPUT_DIR exactly so atomic .tmp+rename
+      # writes are visible to nginx's inotify loop.
+      - /var/lib/vibe/connect/tls:/etc/nginx/tls:ro
+
+secrets:
+  postgres_password:
+    file: /etc/vibe/connect/postgres_password

@@ -1,0 +1,17 @@
+# Runtime-generated, should never be committed.
+ingress/landing/__vibe_installed.json
+tests/golden/Caddyfile.*.tmp
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.vscode/
+
+# Anything emitted by an ad-hoc local smoke test.
+tests/_local-*
+
+# Cosign signing artifacts created locally (real ones come from CI).
+install.sh.sig
+install.sh.crt
+install.sh.sha256
+install.sh.verify

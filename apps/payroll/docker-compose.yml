@@ -1,0 +1,196 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/Vibe-Payroll-Time:docker-compose.prod.yml
+#   upstream commit: ef6d4acd855257b30bb30bb05680b4eac8ef1de4 (2026-04-20)
+# Refresh with:
+#   cp ~/Projects/Vibe-Payroll-Time/docker-compose.prod.yml \
+#      ~/Projects/vibe-installer/apps/payroll/docker-compose.yml
+# NOTE: This compose ships its own Caddy + cloudflared/tailscale sidecars.
+# In multi-app mode, the installer's docker-compose.grouped.yml below
+# disables Payroll's bundled Caddy (the shared vibe-installer ingress
+# replaces it). The cloudflared/tailscale profiles stay opt-in.
+# Prereq P-A: Payroll must publish vibe-payroll-{api,web} images to GHCR
+# before this app can be installed.
+# =====================================================================
+#
+## Vibe Payroll Time — production appliance stack.
+##
+## Everything runs on a single Docker host (e.g., a GMKtec NucBox M6 on Ubuntu
+## Server 24.04 LTS). Caddy terminates TLS for the `public` profile, or
+## forwards from a Cloudflare/Tailscale tunnel sidecar for the `tunnel`
+## profiles.
+##
+##   Public internet direct:     docker compose -f docker-compose.prod.yml --profile public up -d
+##   Cloudflare Tunnel:          docker compose -f docker-compose.prod.yml --profile cloudflare up -d
+##   Tailscale Funnel:           docker compose -f docker-compose.prod.yml --profile tailscale up -d
+##
+## Services + images follow the Vibe distribution convention:
+##   service `api`  → image ghcr.io/kisaesdevlab/vibe-payroll-api  → container vibept-api
+##   service `web`  → image ghcr.io/kisaesdevlab/vibe-payroll-web  → container vibept-web
+## Per the convention, prod pulls from GHCR by tag and never builds locally.
+## Use docker-compose.grouped.yml (overlaid on docker-compose.yml) for local
+## multi-app dev that needs to build from source.
+
+name: vibept-prod
+
+x-api-env: &api-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  APPLIANCE_ID: ${APPLIANCE_ID:?set APPLIANCE_ID}
+  BACKEND_HOST: 0.0.0.0
+  BACKEND_PORT: 4000
+  CORS_ORIGIN: ${CORS_ORIGIN:-https://${APP_DOMAIN}}
+  COOKIE_PATH: ${COOKIE_PATH:-/}
+  COOKIE_SECURE: ${COOKIE_SECURE:-true}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_USER: ${POSTGRES_USER:-vibept}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB:-vibept}
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (>=32 chars)}
+  SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:?set SECRETS_ENCRYPTION_KEY (64-char hex)}
+  MIGRATE_ON_BOOT: ${MIGRATE_ON_BOOT:-true}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vibept-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vibept}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-vibept}
+    # Level-1 backup: enable WAL archiving so we have PITR capability. The
+    # archive target is a plain directory mounted from the host — the weekly
+    # S3 job (scripts/appliance/backup-weekly-s3.sh) picks it up from there.
+    # Overridable via WAL_ARCHIVE_MODE=off if a customer insists.
+    command: >
+      postgres
+        -c wal_level=${WAL_LEVEL:-replica}
+        -c archive_mode=${WAL_ARCHIVE_MODE:-on}
+        -c archive_command='test ! -f /wal-archive/%f && cp %p /wal-archive/%f'
+        -c archive_timeout=${WAL_ARCHIVE_TIMEOUT:-300}
+        -c max_wal_senders=${MAX_WAL_SENDERS:-3}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ${WAL_ARCHIVE_DIR:-/var/backups/vibept-wal}:/wal-archive
+    networks: [internal]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-vibept} -d ${POSTGRES_DB:-vibept}']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    # Postgres is never exposed to the host in prod by default; api reaches
+    # it via the `internal` network only. Operators who need direct psql
+    # access can drop a docker-compose.override.yml that publishes 5432.
+
+  api:
+    image: ghcr.io/kisaesdevlab/vibe-payroll-api:${IMAGE_TAG:-latest}
+    container_name: vibept-api
+    restart: unless-stopped
+    environment: *api-env
+    volumes:
+      # Shared with the host so the self-service updater (SuperAdmin UI)
+      # can drop a request file that a systemd path unit picks up. The
+      # host-side update-from-request.sh runs update.sh and streams
+      # stdout/stderr back to log.txt, which the api tails for the UI.
+      - ${UPDATE_CONTROL_DIR:-./update-control}:/app/update-control
+      # Payroll-export CSVs land here. payroll_exports rows reference
+      # files by relative path; without a persistent volume every
+      # `update.sh` (which recreates the container) would orphan past
+      # exports and break re-download from the export history. The
+      # nightly retention sweep prunes the directory on disk.
+      - exports:/app/exports
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+
+  web:
+    image: ghcr.io/kisaesdevlab/vibe-payroll-web:${IMAGE_TAG:-latest}
+    container_name: vibept-web
+    restart: unless-stopped
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vibept-caddy
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:-localhost}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:-admin@example.com}
+    ports:
+      # Exposed for the `public` profile; tunnel profiles reach Caddy via the
+      # internal network only and can comment these out safely.
+      - '${CADDY_HTTP_PORT:-80}:80'
+      - '${CADDY_HTTPS_PORT:-443}:443'
+    volumes:
+      # Tunnel profiles use the default tunnel-mode Caddyfile (binds :8080
+      # only). The public profile sets CADDYFILE_PATH=./caddy/Caddyfile.public
+      # in .env so Caddy listens on {$APP_DOMAIN}:80 + :443 with auto-TLS.
+      - ${CADDYFILE_PATH:-./caddy/Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+      - web
+    networks: [internal]
+
+  # --------------------------------------------------------------------------
+  # Cloudflare Tunnel sidecar (profile: cloudflare)
+  #
+  # Provision a tunnel at https://one.dash.cloudflare.com, paste the generated
+  # token into CLOUDFLARE_TUNNEL_TOKEN, and configure the tunnel to route to
+  # `http://caddy:8080`. No ports are exposed on the host.
+  # --------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: vibept-cloudflared
+    restart: unless-stopped
+    profiles: ['cloudflare']
+    # :- (not :?) so operators choosing a different profile don't need to
+    # set tunnel creds just to satisfy compose interpolation. cloudflared
+    # fails fast with a clear error if the placeholder reaches it.
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-MISSING_CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - caddy
+    networks: [internal]
+
+  # --------------------------------------------------------------------------
+  # Tailscale Funnel sidecar (profile: tailscale)
+  #
+  # Auth with a reusable ephemeral key from https://login.tailscale.com.
+  # The sidecar joins the tailnet and funnels :443 → caddy:8080.
+  # --------------------------------------------------------------------------
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: vibept-tailscale
+    restart: unless-stopped
+    profiles: ['tailscale']
+    hostname: ${TAILSCALE_HOSTNAME:-vibept}
+    environment:
+      # :- (not :?) so operators choosing a different profile don't need to
+      # set an auth key. Tailscale fails fast with a clear error if the
+      # placeholder reaches it.
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY:-MISSING_TAILSCALE_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: 'true'
+      TS_EXTRA_ARGS: --advertise-tags=tag:vibept-appliance
+      TS_SERVE_CONFIG: /config/tailscale-serve.json
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./caddy/tailscale-serve.json:/config/tailscale-serve.json:ro
+    depends_on:
+      - caddy
+    networks: [internal]
+
+volumes:
+  pgdata:
+  caddy-data:
+  caddy-config:
+  tailscale-state:
+  exports:
+
+networks:
+  internal:
+    driver: bridge

@@ -1,0 +1,31 @@
+# vibe-installer config — managed by `vibe`. Hand-edit at your own risk.
+# This file is rendered to /etc/vibe/vibe.conf on first install and updated
+# by `vibe install` / `vibe uninstall` / `vibe mode` thereafter.
+
+# Mode: single (legacy: per-app ports, no ingress) | multi (Caddy ingress at /<app>/).
+# New installs always come up in multi-app mode so URLs stay stable across
+# adding/removing apps. The single-app shape is preserved only for legacy
+# /etc/vibe/vibe.conf files written before the always-multi switch — those
+# are migrated on next `vibe` invocation. New writes always pick `multi`.
+mode=multi
+
+# Hostname this appliance answers to. Examples:
+#   vibe.local          — LAN / mDNS
+#   books.kispcal.com   — public FQDN with ACME
+host=vibe.local
+
+# TLS strategy:
+#   internal   — Caddy 'tls internal' + caddy trust on the host (LAN/mDNS)
+#   acme       — Caddy ACME HTTP-01 on :80 (public FQDN, A record required)
+#   cf-tunnel  — Cloudflare Tunnel terminates TLS upstream; Caddy plain HTTP
+tls_mode=internal
+
+# Contact email for ACME (Let's Encrypt) renewal alerts. Only used when
+# tls_mode=acme. Renewal warnings won't be deliverable if blank.
+acme_email=
+
+# Comma-separated list of installed Vibe apps. Sorted, no spaces.
+installed=
+
+# Last time the license public key bundle was refreshed (unix epoch).
+license_pubkey_fetched_at=0

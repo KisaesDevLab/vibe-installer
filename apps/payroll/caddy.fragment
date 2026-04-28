@@ -1,0 +1,41 @@
+# Vibe Payroll Time — Caddy route fragment.
+#
+# In multi-app mode Payroll's bundled Caddy is disabled by the installer's
+# grouped overlay (apps/payroll/docker-compose.grouped.yml). The shared
+# vibe-installer Caddy ingress reaches Payroll's api + web directly.
+#
+# Routing: Caddy strips /payroll/ before forwarding so the upstream
+# containers stay mode-agnostic — the api expects /api/v1/* and the web
+# nginx expects unprefixed /assets/, /index.html, /sw.js etc. The web
+# image's runtime base-path substitution handles the SPA bundle's URLs
+# (assets resolve to /payroll/assets/... in the browser, the upstream
+# request after Caddy strip is /assets/...).
+#
+# Health probe alias (operator + smoke test friendly): /payroll/health →
+# api's /api/v1/health.
+
+handle /payroll/health {
+    rewrite * /api/v1/health
+    reverse_proxy vibept-api:4000
+}
+
+# API: bypass web entirely. /payroll/api/v1/x → /api/v1/x → api:4000.
+# X-Forwarded-Prefix lets the api emit absolute URLs that include the
+# /payroll/ prefix when needed (cookies, redirects, emailed links).
+handle_path /payroll/api/* {
+    rewrite * /api{uri}
+    reverse_proxy vibept-api:4000 {
+        header_up X-Forwarded-Prefix /payroll
+    }
+}
+
+# SPA + static assets. Web container listens on :8080 (not 80 — the
+# upstream nginx.conf binds 8080 and that matches the EXPOSE 8080 in
+# frontend/Dockerfile).
+handle_path /payroll/* {
+    reverse_proxy vibept-web:8080
+}
+
+handle /payroll {
+    redir /payroll/ permanent
+}

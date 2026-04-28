@@ -1,0 +1,155 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write   # for cosign keyless OIDC signing
+
+jobs:
+  # ---------------------------------------------------------------
+  # Cross-compile vibed for linux/amd64 + linux/arm64 in parallel.
+  # install.sh::ensure_vibed downloads from
+  #   https://github.com/.../releases/download/<tag>/vibed-linux-<arch>
+  # so the binary names matter — keep them stable across releases.
+  # ---------------------------------------------------------------
+  build-vibed:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            artifact: vibed-linux-amd64
+          - goarch: arm64
+            artifact: vibed-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/vibed/go.mod
+          # vibed is stdlib-only so there's no go.sum; hash go.mod
+          # for the cache key instead. setup-go falls back to this
+          # automatically, but specifying it suppresses the warning.
+          cache-dependency-path: tools/vibed/go.mod
+
+      - name: Build vibed (${{ matrix.goarch }})
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          cd tools/vibed
+          # -trimpath strips local build paths from the binary; -ldflags
+          # bakes in the release tag so `vibed --version` reports a
+          # meaningful string instead of "dev". The static binary
+          # (CGO_ENABLED=0) means no glibc-version surprises across
+          # Ubuntu 22.04 / 24.04 hosts.
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.VibedVersion=${GITHUB_REF_NAME}" \
+            -o "../../${{ matrix.artifact }}" \
+            .
+          file "../../${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------
+  # Sign install.sh with cosign + attach everything to the release.
+  # Depends on build-vibed so the GitHub Release lands with both the
+  # signed install.sh AND the cross-compiled vibed binaries available
+  # on first publish.
+  # ---------------------------------------------------------------
+  sign-and-release:
+    runs-on: ubuntu-24.04
+    needs: build-vibed
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.0'
+
+      - name: Download vibed binaries from build-vibed jobs
+        uses: actions/download-artifact@v4
+        with:
+          path: ./vibed-binaries
+          merge-multiple: true
+
+      # SHA256 + cosign keyless signature over install.sh. The signature is
+      # verifiable with the canonical OIDC issuer + this repo's identity.
+      - name: Hash + sign install.sh
+        run: |
+          set -euo pipefail
+          sha256sum install.sh > install.sh.sha256
+          COSIGN_EXPERIMENTAL=1 cosign sign-blob \
+              --yes \
+              --output-signature install.sh.sig \
+              --output-certificate install.sh.crt \
+              install.sh
+
+      - name: Hash vibed binaries
+        run: |
+          set -euo pipefail
+          # Operators verify these against the GitHub-published values
+          # before trusting the binary. cosign-signing the binaries
+          # too would be nice but doubles the release flow surface;
+          # SHA256 is sufficient for v0.x.
+          for f in ./vibed-binaries/vibed-linux-*; do
+              sha256sum "$f" > "$f.sha256"
+              # Move the sha256 file alongside the binary at the top
+              # level so `gh release create` finds it without extra
+              # globbing.
+              mv "$f" .
+              mv "$f.sha256" .
+          done
+          ls -la vibed-linux-*
+
+      - name: Generate verification snippet for the release notes
+        run: |
+          cat > install.sh.verify <<'EOF'
+          # Verify install.sh before piping it into bash:
+          curl -fsSL https://github.com/KisaesDevLab/vibe-installer/releases/download/${TAG}/install.sh     -o /tmp/install.sh
+          curl -fsSL https://github.com/KisaesDevLab/vibe-installer/releases/download/${TAG}/install.sh.sig -o /tmp/install.sh.sig
+          curl -fsSL https://github.com/KisaesDevLab/vibe-installer/releases/download/${TAG}/install.sh.crt -o /tmp/install.sh.crt
+          cosign verify-blob \
+              --certificate /tmp/install.sh.crt \
+              --signature   /tmp/install.sh.sig \
+              --certificate-identity-regexp '^https://github.com/KisaesDevLab/vibe-installer/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              /tmp/install.sh
+          # If verification succeeds:
+          sudo bash /tmp/install.sh
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+              install.sh \
+              install.sh.sha256 \
+              install.sh.sig \
+              install.sh.crt \
+              vibed-linux-amd64 \
+              vibed-linux-amd64.sha256 \
+              vibed-linux-arm64 \
+              vibed-linux-arm64.sha256 \
+              --notes-file <(printf '## Verifying install.sh\n\n```bash\n%s\n```\n\n## vibed binaries\n\nCross-compiled static (CGO_ENABLED=0) for `linux/amd64` and `linux/arm64`. `install.sh::ensure_vibed` fetches the matching architecture automatically; manual install is `sudo install -m 0755 vibed-linux-<arch> /usr/local/bin/vibed && sudo systemctl restart vibed`.\n' "$(sed "s/\${TAG}/$TAG/g" install.sh.verify)")

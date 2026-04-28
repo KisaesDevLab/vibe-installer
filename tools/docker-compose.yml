@@ -1,0 +1,59 @@
+# Admin tools — Portainer + Duplicati.
+#
+# Brought up by `vibe install tools`. Lives on its own `vibe_admin` network,
+# NOT joined to `vibe_ingress`. Both containers bind to 127.0.0.1 only, so
+# the Caddy ingress never exposes them publicly. Operators reach them via
+# Tailscale `ssh -L` or browse from the LAN.
+#
+# Portainer:  https://127.0.0.1:9443/
+# Duplicati:  http://127.0.0.1:8200/
+
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: vibe-tools-portainer
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:9443:9443'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/vibe/tools/portainer:/data
+    networks: [vibe_admin]
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  duplicati:
+    image: lscr.io/linuxserver/duplicati:latest
+    container_name: vibe-tools-duplicati
+    restart: unless-stopped
+    environment:
+      # PUID/PGID match the host's `vibe` system user so Duplicati can read
+      # /var/lib/vibe/<app>/ (mode 0750, owned by vibe). tools_install
+      # populates these from `id -u/-g vibe` at first run.
+      PUID: '${VIBE_UID:-1000}'
+      PGID: '${VIBE_GID:-1000}'
+      TZ: '${TZ:-UTC}'
+      SETTINGS_ENCRYPTION_KEY: '${DUPLICATI_SETTINGS_KEY:?DUPLICATI_SETTINGS_KEY must be set in /etc/vibe/tools/.env}'
+    ports:
+      - '127.0.0.1:8200:8200'
+    volumes:
+      - /var/lib/vibe/tools/duplicati:/config
+      # Read-only access to per-app data so Duplicati can back it up to a
+      # remote target the operator configures via its UI.
+      - /var/lib/vibe:/source:ro
+      - /var/lib/vibe/tools/backups:/backups
+    networks: [vibe_admin]
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+networks:
+  vibe_admin:
+    driver: bridge

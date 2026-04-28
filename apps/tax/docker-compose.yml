@@ -1,0 +1,149 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/Vibe-Tax-Research-Chat:docker-compose.prod.yml
+# Refresh with:
+#   cp ~/Projects/Vibe-Tax-Research-Chat/docker-compose.prod.yml \
+#      ~/Projects/vibe-installer/apps/tax/docker-compose.yml
+# (The upstream compose builds locally; this vendored copy is rewritten
+# to pull pinned tags from GHCR per the Vibe distribution convention.)
+#
+# Prereq T-A: Vibe-Tax-Research-Chat must publish vibe-tax-{api,web}
+# images to GHCR before this app can be installed. The release.yml
+# workflow on branch feat/installer-readiness adds the publish job;
+# until that branch is merged + tagged, `vibe install tax` will fail
+# fast with a "ghcr image not found" error.
+# =====================================================================
+#
+## Vibe Tax Research Chat — production appliance stack.
+##
+## Self-hosted single-tenant AI tax-research chat for U.S. CPAs. Adds
+## one piece of infrastructure none of the other Vibe apps run today:
+##   - Redis 7 (cache + BullMQ job queue for skills sync, usage rollup,
+##     backups). Volume lives at /var/lib/vibe/tax/redis-data.
+##
+## Service / container / image naming follows the Vibe distribution
+## convention:
+##   service `api`  → image ghcr.io/kisaesdevlab/vibe-tax-api  → container vibe-tax-api
+##   service `web`  → image ghcr.io/kisaesdevlab/vibe-tax-web  → container vibe-tax-web
+##
+## Single-app standalone (developer convenience, not how the installer
+## drives it — installer always layers the grouped overlay below):
+##   docker compose -f docker-compose.yml up -d
+##
+## Multi-app (installer): grouped overlay joins api + web to the
+## external `vibe_ingress` network and sets VITE_BASE_PATH=/tax/.
+
+name: vibe-tax
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vibe-tax-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vibe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-vibe_tax}
+    volumes:
+      - /var/lib/vibe/tax/postgres-data:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-vibe} -d ${POSTGRES_DB:-vibe_tax}']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: vibe-tax-redis
+    restart: unless-stopped
+    # appendonly so BullMQ job state survives a host reboot. Without
+    # AOF a poweroff during a long Anthropic generation would lose the
+    # in-flight job and the SPA's "Generating…" spinner would hang.
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - /var/lib/vibe/tax/redis-data:/data
+    networks: [internal]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    image: ghcr.io/kisaesdevlab/vibe-tax-api:${IMAGE_TAG:-latest}
+    container_name: vibe-tax-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      DATABASE_URL: postgres://${POSTGRES_USER:-vibe}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-vibe_tax}
+      REDIS_URL: redis://redis:6379
+      MASTER_KEY: ${MASTER_KEY:?set MASTER_KEY (64-char hex / 32 bytes)}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (>=32 chars)}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET (>=32 chars)}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+      SKILLS_REPO_URL: ${SKILLS_REPO_URL:-https://github.com/KisaesDevLab/Vibe-Claude-Tax-Research-Skills}
+      SKILLS_REPO_PIN_TYPE: ${SKILLS_REPO_PIN_TYPE:-tag}
+      SKILLS_REPO_PIN_VALUE: ${SKILLS_REPO_PIN_VALUE:-v1.0.0-beta}
+      SKILLS_WORKSPACE_DIR: /app/workspaces/skills
+      MODELS_MANIFEST_URL: ${MODELS_MANIFEST_URL:-https://vibemb.com/manifests/anthropic-models.json}
+      BACKUP_DIR: /app/backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+    volumes:
+      # Skills repo clone + per-user workspaces. The api worker pulls
+      # the skills repo at startup and on webhook; losing this volume
+      # forces a re-clone (slow but not destructive).
+      - /var/lib/vibe/tax/workspaces:/app/workspaces
+      # Uploaded attachments (PDFs, screenshots) referenced by chats.
+      # Persistent because the chat history's attachment_id rows would
+      # become dead links otherwise.
+      - /var/lib/vibe/tax/attachments:/app/attachments
+      # Backup target — pg_dump output + skills snapshot land here. The
+      # nightly retention sweep runs in-process per BACKUP_RETENTION_DAYS.
+      - /var/lib/vibe/tax/backups:/app/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [internal]
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '-', 'http://localhost:4000/api/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  web:
+    image: ghcr.io/kisaesdevlab/vibe-tax-web:${IMAGE_TAG:-latest}
+    container_name: vibe-tax-web
+    restart: unless-stopped
+    # Runtime base-path substitution. VITE_BASE_PATH=/ is the single-app
+    # default; the grouped overlay sets it to /tax/ for multi-app mode.
+    # The web container's docker-entrypoint.d/40-base-path.sh hook
+    # reads this and rewrites the SPA bundle's asset URLs before nginx
+    # starts. Same image, two modes, no rebuild.
+    environment:
+      VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
+    networks: [internal]
+    # Single-app standalone publishes :80; the grouped overlay can
+    # remove this if the host port collides.
+    ports:
+      - '${WEB_PUBLISH_PORT:-8082}:80'
+    depends_on:
+      - api
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '-', 'http://localhost:80/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  internal:
+    driver: bridge

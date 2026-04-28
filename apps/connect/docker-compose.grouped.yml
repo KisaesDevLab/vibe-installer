@@ -1,0 +1,58 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/vibe-connect:infra/docker/docker-compose.grouped.yml
+#   upstream commit: 0ae42f9fe595baf7ee30ac37dab8b6fc9a877af8 (2026-04-24)
+# =====================================================================
+#
+# Multi-app dev overlay — layer this on top of docker-compose.yml to test
+# the installer's Caddy ingress locally. Caddy lives in the
+# `vibe-installer` repo and joins the same `vibe_ingress` external network;
+# without that network already created by the installer, the overlay
+# refuses to start (which is what we want — there's no point bringing
+# multi-app mode up without the proxy in front).
+#
+# Usage:
+#   docker network create vibe_ingress      # once, normally done by `vibe install`
+#   docker compose -f docker-compose.yml -f docker-compose.grouped.yml up
+#
+# Effect:
+#   - Cookies scoped to '/connect' so a sibling Vibe app on the same host
+#     can't read them.
+#   - SPA mounted at '/connect' (Vite base + <base href> injection both
+#     pick this up at runtime — no rebuild required).
+#   - In-app ACME disabled; Caddy upstream terminates TLS.
+#   - App + nginx host ports cleared (only the ingress network sees them).
+#   - Postgres host port stays bound for direct psql access during dev.
+services:
+  app:
+    environment:
+      BASE_PATH: '/connect'
+      SESSION_COOKIE_PATH: '/connect'
+      TLS_MODE: 'external'
+      SESSION_SECURE: 'true'
+      # ${VIBE_HOST:-vibe.local} is exported by lib/apps.sh::apps_compose
+      # so the appliance's actual hostname (set during `install.sh`) lands
+      # in these URLs, not the local-dev default.
+      SITE_URL: 'https://${VIBE_HOST:-vibe.local}/connect'
+      PORTAL_URL: 'https://${VIBE_HOST:-vibe.local}/connect/portal'
+      API_URL: 'https://${VIBE_HOST:-vibe.local}/connect'
+    ports: !reset []
+    networks:
+      - default
+      - vibe_ingress
+  nginx:
+    environment:
+      BASE_PATH: '/connect'
+      TLS_MODE: 'external'
+    ports: !reset []
+    networks:
+      - default
+      - vibe_ingress
+  postgres:
+    # Kept on the host for direct psql access from the dev's editor /
+    # tooling — multi-app mode doesn't change DB exposure.
+    ports:
+      - '${POSTGRES_PUBLISH_PORT:-5435}:5432'
+
+networks:
+  vibe_ingress:
+    external: true

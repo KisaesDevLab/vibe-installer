@@ -1,0 +1,50 @@
+# =====================================================================
+# Multi-app overlay (installer-owned) for Vibe Tax Research Chat.
+#
+# Layered on top of apps/tax/docker-compose.yml whenever the host is in
+# multi-app mode (which is the implicit shape from v1.x onward — the
+# single-app code path stays for compatibility with legacy installs).
+#
+# Two responsibilities:
+#
+#   1. Set VITE_BASE_PATH=/tax/ so the web container's
+#      docker-entrypoint.d/40-base-path.sh hook substitutes the SPA
+#      bundle's asset URLs to live under /tax/. Same image as
+#      single-app — no rebuild, the entrypoint is the only switch.
+#
+#   2. Join api + web to the external `vibe_ingress` network so the
+#      shared installer Caddy at https://<host>/tax/ can reach them by
+#      container hostname. postgres + redis stay on `internal` only —
+#      no public surface.
+#
+# We don't need to disable a bundled Caddy here (unlike payroll's
+# overlay) because the upstream tax-chat compose doesn't ship one.
+# =====================================================================
+
+services:
+  api:
+    environment:
+      # Origin of the SPA — Caddy ingress sees `https://<host>` because
+      # the browser strips the path before composing the Origin header.
+      # The api's CORS allowlist matches against this exact value.
+      PUBLIC_BASE_URL: https://${VIBE_HOST:?Set VIBE_HOST for multi-app mode}
+    networks:
+      - internal
+      - vibe_ingress
+
+  web:
+    environment:
+      VITE_BASE_PATH: /tax/
+    # The single-app published port at :8082 collides with no-one in
+    # multi-app, but the shared Caddy proxies to the container hostname
+    # over the internal vibe_ingress network — the published port is
+    # cosmetic and we leave it bound to avoid coupling overlay edits.
+    networks:
+      - internal
+      - vibe_ingress
+
+networks:
+  internal:
+    driver: bridge
+  vibe_ingress:
+    external: true

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vibe Appliance</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <main>
+        <header>
+            <h1>Vibe Appliance</h1>
+            <p class="subtitle">Pick a product to launch.</p>
+        </header>
+
+        <section class="tiles">
+            <!-- Tiles are rendered by lib/ingress.sh on Caddyfile (re-)render.
+                 Each installed app gets one card; the rest are hidden. -->
+            <a class="tile tile--mybooks" href="/mybooks/" data-app="mybooks">
+                <div class="tile__icon">📚</div>
+                <h2>Vibe MyBooks</h2>
+                <p>Bookkeeping &amp; client books.</p>
+            </a>
+
+            <a class="tile tile--connect" href="/connect/" data-app="connect">
+                <div class="tile__icon">💬</div>
+                <h2>Vibe Connect</h2>
+                <p>Encrypted staff &amp; client messaging.</p>
+            </a>
+
+            <a class="tile tile--tb" href="/tb/" data-app="tb">
+                <div class="tile__icon">📊</div>
+                <h2>Vibe TB</h2>
+                <p>Trial-balance workpapers.</p>
+            </a>
+
+            <a class="tile tile--payroll" href="/payroll/" data-app="payroll">
+                <div class="tile__icon">⏱️</div>
+                <h2>Vibe Payroll Time</h2>
+                <p>Time tracking &amp; payroll prep.</p>
+            </a>
+
+            <a class="tile tile--tax" href="/tax/" data-app="tax">
+                <div class="tile__icon">🧾</div>
+                <h2>Vibe Tax Research</h2>
+                <p>AI tax-research chat (CPA-grade citations).</p>
+            </a>
+        </section>
+
+        <footer>
+            <p>Operated by your firm. Powered by the Vibe product family.</p>
+            <p class="hint">
+                <strong>Share this appliance with your team:</strong>
+                bookmark <code id="vibe-current-url"></code> on every device
+                that needs access.
+                <span id="vibe-mdns-warning" hidden>
+                    If a device can't open that address (some Windows
+                    machines without Bonjour can't resolve <code>.local</code>
+                    names), use the IP-address URL printed by
+                    <code>install.sh</code> instead.
+                </span>
+            </p>
+            <p class="hint">
+                Need help? Run <code>vibe doctor</code> on the host or visit the
+                <a href="https://github.com/KisaesDevLab/vibe-installer">installer docs</a>.
+            </p>
+        </footer>
+    </main>
+
+    <!-- Two small enhancements:
+         1. Hide tiles for apps that aren't installed. The installer writes
+            /__vibe_installed.json (one line per app) at render time.
+         2. Surface the current page's URL in the footer so the operator
+            knows what to share with their team — and warn that the .local
+            URL may not resolve on every device on the network. -->
+    <script>
+        (function () {
+            // 1. Tile visibility from /__vibe_installed.json.
+            fetch('/__vibe_installed.json', { cache: 'no-store' })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (installed) {
+                    if (!installed) return;
+                    var apps = installed.apps || [];
+                    document.querySelectorAll('.tile').forEach(function (el) {
+                        if (apps.indexOf(el.dataset.app) === -1) {
+                            el.style.display = 'none';
+                        }
+                    });
+                })
+                .catch(function () { /* leave all tiles visible on fetch error */ });
+
+            // 2. Fill in the share-URL line in the footer. window.location.origin
+            // is the URL the user typed to get here, which is exactly the URL
+            // they should share. Surface a soft warning if that URL is a .local
+            // hostname (mDNS), since not every Windows machine resolves those.
+            var urlEl = document.getElementById('vibe-current-url');
+            var warnEl = document.getElementById('vibe-mdns-warning');
+            if (urlEl) urlEl.textContent = window.location.origin + '/';
+            if (warnEl && /\.local$/i.test(window.location.hostname)) {
+                warnEl.hidden = false;
+            }
+        })();
+    </script>
+</body>
+</html>

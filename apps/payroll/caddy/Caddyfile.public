@@ -1,0 +1,52 @@
+# Vibe Payroll Time — Caddy reverse proxy (public profile).
+#
+# Used when the appliance is reachable directly from the public internet
+# at the operator-supplied APP_DOMAIN. Caddy auto-provisions a Let's
+# Encrypt certificate on first successful HTTP-01 challenge.
+#
+# Selected by docker-compose.prod.yml's CADDYFILE_PATH env var, which
+# install.sh writes to .env when PROFILE=public:
+#
+#   CADDYFILE_PATH=./caddy/Caddyfile.public
+#
+# Tunnel profiles (cloudflare, tailscale) keep the default
+# ./caddy/Caddyfile, which only listens on :8080 and lets the sidecar
+# terminate TLS.
+
+{
+	admin localhost:2019
+	email {$CADDY_ACME_EMAIL:admin@example.com}
+}
+
+# Public-facing site. The {$APP_DOMAIN} substitution becomes the operator's
+# domain (e.g. time.example-cpa.com). Caddy auto-binds :80 + :443 for any
+# named site and provisions a Let's Encrypt cert on the first request.
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	handle /api/* {
+		reverse_proxy api:4000 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	handle {
+		reverse_proxy web:8080
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

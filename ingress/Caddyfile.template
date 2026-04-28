@@ -1,0 +1,59 @@
+{
+@@EMAIL_LINE@@
+    # Off-default admin API. We re-render + reload by SIGHUPing the container.
+    admin off
+}
+
+# =====================================================================
+# Main host block — all traffic terminates here, then routes by path
+# prefix into one of the installed apps.
+# =====================================================================
+{$VIBE_HOST} {
+@@TLS_DIRECTIVE@@
+
+    # ---- Landing page (no path prefix) -----------------------------
+    handle / {
+        root * /srv/landing
+        try_files {path} /index.html
+        file_server
+    }
+
+    # /healthz is the ingress's own liveness probe, separate from per-app
+    # health endpoints. Used by `vibe doctor`.
+    handle /healthz {
+        respond "ingress: ok" 200
+    }
+
+    # ---- Per-app fragments ----------------------------------------
+@@APP_FRAGMENTS@@
+
+    # ---- Catch-all: bare files served from /srv/landing ------------
+    # Lets the landing page reference its own /style.css, /favicon.ico
+    # without each app needing to handle root assets.
+    handle {
+        root * /srv/landing
+        file_server
+    }
+
+    # Standard production headers.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    log {
+        output stdout
+        format json
+        level INFO
+    }
+}
+
+# =====================================================================
+# In `cf-tunnel` mode, also accept plain HTTP on the cloudflared-private
+# loopback so the tunnel can route to us. Cloudflare terminates TLS at
+# the edge.
+# =====================================================================
+@@CF_TUNNEL_BLOCK@@

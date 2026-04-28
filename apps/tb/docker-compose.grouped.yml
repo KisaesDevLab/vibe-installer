@@ -1,0 +1,39 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/trial-balance-app:docker-compose.grouped.yml
+#   upstream commit: 259c8380d79c72b2f7b6fbe0773747e641fb92b8 (2026-04-18)
+# =====================================================================
+#
+# Multi-app overlay — applies on top of docker-compose.prod.yml when Vibe TB
+# shares a host with other Vibe products behind a shared Caddy ingress.
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.grouped.yml up -d
+#
+# Pre-reqs:
+# - The external `vibe_ingress` Docker network exists (the vibe-installer's
+#   `install.sh` creates it; for ad-hoc testing run `docker network create
+#   vibe_ingress`).
+# - VIBE_HOST is set in .env to the FQDN that fronts all Vibe apps.
+# - A Caddy container in `vibe_ingress` routes /tb/* to web:80 and api:3001
+#   (handled by the vibe-installer's ingress/Caddyfile.template).
+
+services:
+  web:
+    # Caddy reaches this via the vibe_ingress network — no host port.
+    ports: !reset []
+    environment:
+      VITE_BASE_PATH: /tb/
+    networks:
+      - default
+      - vibe_ingress
+
+  api:
+    environment:
+      ALLOWED_ORIGIN: https://${VIBE_HOST:?Set VIBE_HOST for multi-app mode}
+      APP_BASE_URL: https://${VIBE_HOST}/tb
+    networks:
+      - default
+      - vibe_ingress
+
+networks:
+  vibe_ingress:
+    external: true

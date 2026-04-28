@@ -1,0 +1,52 @@
+# GLM-OCR — local OCR appliance.
+#
+# A self-contained llama.cpp server with the GLM-OCR GGUF model baked in.
+# Brought up by `vibe install glm-ocr`. Joins the `vibe_ingress` network so
+# Vibe apps reach it as `http://vibe-glm-ocr:8090`.
+#
+# Single-app mode: also publishes 127.0.0.1:8090 so the operator can call
+# the OpenAI-compatible /v1/chat/completions endpoint locally.
+#
+# In multi-app mode, traffic stays on the internal network — the shared
+# Caddy ingress does NOT expose OCR publicly (no model serving from outside).
+
+services:
+  glm-ocr:
+    image: ${GLM_OCR_IMAGE:-ghcr.io/kisaesdevlab/vibe-glm-ocr:latest}
+    container_name: vibe-glm-ocr
+    pull_policy: missing
+    restart: unless-stopped
+    environment:
+      OCR_PORT: '8090'
+      OCR_THREADS: '${OCR_THREADS:-4}'
+      OCR_PARALLEL: '${OCR_PARALLEL:-2}'
+      OCR_API_KEY: '${OCR_API_KEY:-}'
+    ports:
+      - '127.0.0.1:${OCR_HOST_PORT:-8090}:8090'
+    volumes:
+      - /var/lib/vibe/glm-ocr/cache:/cache
+    networks:
+      default:
+        aliases:
+          - vibe-glm-ocr
+      vibe_ingress:
+        aliases:
+          - vibe-glm-ocr
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:8090/health || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    mem_limit: ${GLM_OCR_MEM_LIMIT:-4g}
+    mem_reservation: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+networks:
+  default:
+  vibe_ingress:
+    external: true

@@ -1,0 +1,57 @@
+# Vibe Payroll Time — Caddy reverse proxy (tunnel profiles).
+#
+# The Cloudflare Tunnel / Tailscale Funnel sidecars terminate TLS and forward
+# to `http://caddy:8080`, so this file binds to :8080 and does not request
+# certificates.
+#
+# When exposed directly to the public internet (--profile public), the stack
+# uses caddy/Caddyfile.public instead — install.sh sets CADDYFILE_PATH in
+# .env to swap which file docker-compose.prod.yml mounts.
+
+{
+	# Turn on the admin API only on localhost.
+	admin localhost:2019
+	# Keep the default auto-TLS on for the public-ingress block below.
+	email {$CADDY_ACME_EMAIL:admin@example.com}
+}
+
+# ----------------------------------------------------------------------------
+# Internal ingress (tunnel sidecar terminates TLS, forwards to :8080)
+# ----------------------------------------------------------------------------
+:8080 {
+	encode zstd gzip
+
+	# Security headers applied globally. CSP intentionally permissive for the
+	# SPA; tighten once we catalog all third-party script origins.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# Backend API.
+	handle /api/* {
+		reverse_proxy api:4000 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Frontend static bundle, served by nginx.
+	handle {
+		reverse_proxy web:8080
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# Direct-to-internet deployments use caddy/Caddyfile.public, which Caddy
+# selects via the CADDYFILE_PATH env var that install.sh writes to .env
+# when PROFILE=public.

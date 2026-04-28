@@ -1,0 +1,96 @@
+# =====================================================================
+# VENDORED from KisaesDevLab/vibe-mybooks:docker-compose.grouped.yml
+#   (post the runtime-base-path refactor — sentinel + entrypoint hook).
+# =====================================================================
+#
+# vibe-distribution-plan §multi-app overlay (Phase D4).
+#
+# Layers on top of docker-compose.yml to flip Vibe MyBooks from
+# single-app mode (each container publishes its own host port,
+# cookies on Path=/) into multi-app mode (a sibling Caddy ingress
+# at https://${VIBE_HOST}/ owns 80/443; this stack is reachable
+# only at https://${VIBE_HOST}/mybooks/).
+#
+# Usage:
+#   docker network create vibe_ingress             # once per host
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.grouped.yml up -d
+#
+# What this overlay does, and why:
+#
+#   - `api.ports: []` and `web.ports: []` clear the single-app
+#     publishes from the base compose. Only the Caddy container
+#     (which lives in a separate compose project) publishes 80/443.
+#     Removing host bindings prevents accidental direct access that
+#     would bypass the cookie-path / TLS guarantees of the front door.
+#
+#   - Both containers join the external `vibe_ingress` network so
+#     Caddy can address them by service name (mybooks-api,
+#     mybooks-web). The internal compose network stays so api ↔ db,
+#     api ↔ redis, worker ↔ db continue working without exposure.
+#
+#   - Multi-app cookie + WebAuthn isolation env (vibe-distribution-plan
+#     §Vibe MyBooks env table). COOKIE_SECURE=1 is forced because the
+#     ingress always terminates HTTPS in this mode regardless of
+#     NODE_ENV on the host.
+#
+#   - VITE_BASE_PATH=/mybooks/ is set on the web service. The image's
+#     /docker-entrypoint.d/40-base-path.sh substitutes the build-time
+#     sentinel `/__VIBE_BASE_PATH__/` across html/js/css/json/map at
+#     container start. Same image runs in single-app and multi-app —
+#     no rebuild needed.
+#
+# DB and Redis stay on the internal default network only. The shared
+# ingress never touches data services.
+
+services:
+  api:
+    # Empty array clears any host-port publishes inherited from the
+    # base compose. A single line of `ports:` with no list members
+    # would be ignored by Compose v2; the explicit `[]` is the
+    # supported way to drop the parent's bindings.
+    # `!reset` (Compose v2 ≥ 2.20, see compose-spec.io merge.html) is
+    # the only reliable way to wipe a parent override's array — bare
+    # `ports: []` is silently treated as "no change" because Compose
+    # merges sequences positionally.
+    ports: !reset []
+    networks:
+      - default
+      - vibe_ingress
+    environment:
+      COOKIE_PATH: /mybooks
+      COOKIE_SECURE: "1"
+      PUBLIC_URL: https://${VIBE_HOST:-vibe.local}/mybooks
+      CORS_ORIGIN: https://${VIBE_HOST:-vibe.local}
+      WEBAUTHN_RP_ID: ${VIBE_HOST:-vibe.local}
+
+  web:
+    # `!reset` (Compose v2 ≥ 2.20, see compose-spec.io merge.html) is
+    # the only reliable way to wipe a parent override's array — bare
+    # `ports: []` is silently treated as "no change" because Compose
+    # merges sequences positionally.
+    ports: !reset []
+    networks:
+      - default
+      - vibe_ingress
+    environment:
+      # Runtime base-path substitution — the web container's
+      # /docker-entrypoint.d/40-base-path.sh hook reads this value
+      # and rewrites `/__VIBE_BASE_PATH__/` across html/js/css/json/map
+      # before nginx starts. One image, two modes, no rebuild.
+      # (Replaces the pre-2026-04 build-arg pattern.)
+      VITE_BASE_PATH: /mybooks/
+
+  worker:
+    # Worker runs the schedulers; no inbound traffic, so no network
+    # change. Keep it on the default compose network only.
+    environment:
+      COOKIE_PATH: /mybooks
+      COOKIE_SECURE: "1"
+      PUBLIC_URL: https://${VIBE_HOST:-vibe.local}/mybooks
+      CORS_ORIGIN: https://${VIBE_HOST:-vibe.local}
+      WEBAUTHN_RP_ID: ${VIBE_HOST:-vibe.local}
+
+networks:
+  vibe_ingress:
+    external: true

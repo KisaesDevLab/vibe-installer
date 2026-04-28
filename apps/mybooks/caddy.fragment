@@ -1,0 +1,54 @@
+# Vibe MyBooks — Caddy route fragment.
+#
+# Routing model: Caddy strips /mybooks/ before forwarding so the upstream
+# web nginx and api stay mode-agnostic. The web container's runtime
+# base-path substitution (packages/web/docker-entrypoint.d/40-base-path.sh)
+# rewrites the SPA bundle's URLs to /mybooks/... in the browser, but the
+# upstream container only ever sees the unprefixed paths once Caddy has
+# stripped /mybooks/.
+#
+# Caddy reaches MyBooks containers by their compose-generated names:
+#   vibe-mybooks-api-1  (port 3001)
+#   vibe-mybooks-web-1  (port 5173)
+# Both join the external `vibe_ingress` network when the installer
+# layers docker-compose.grouped.yml on top of the base compose.
+
+# Operator-friendly health probe — alias /mybooks/health to /health
+# on the API (skips the web layer entirely).
+handle /mybooks/health {
+    rewrite * /health
+    reverse_proxy vibe-mybooks-api-1:3001
+}
+
+# API: bypass web entirely. /mybooks/api/v1/x → /api/v1/x → api:3001.
+# Also covers the install-time setup wizard at /mybooks/api/setup/*
+# which the SPA's FirstRunSetupWizard fetches via
+# `${import.meta.env.BASE_URL}api/setup/...`. X-Forwarded-Prefix lets
+# the api emit absolute URLs that include the /mybooks/ prefix when
+# needed (cookies, redirects, emailed links).
+handle_path /mybooks/api/* {
+    rewrite * /api{uri}
+    reverse_proxy vibe-mybooks-api-1:3001 {
+        header_up X-Forwarded-Prefix /mybooks
+    }
+}
+
+# /oauth/* (Plaid + storage OAuth callbacks). Same pattern — bypass web.
+handle_path /mybooks/oauth/* {
+    rewrite * /oauth{uri}
+    reverse_proxy vibe-mybooks-api-1:3001 {
+        header_up X-Forwarded-Prefix /mybooks
+    }
+}
+
+# SPA + static assets. Caddy strips /mybooks/ → web nginx serves
+# /index.html, /assets/..., /favicon.ico, etc. from /usr/share/nginx/html.
+handle_path /mybooks/* {
+    reverse_proxy vibe-mybooks-web-1:5173
+}
+
+# Bare /mybooks (no trailing slash) — redirect to /mybooks/ so the SPA
+# loads its index.html instead of falling through to the landing page.
+handle /mybooks {
+    redir /mybooks/ permanent
+}

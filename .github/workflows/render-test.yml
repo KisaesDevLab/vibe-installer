@@ -1,0 +1,85 @@
+name: render-test
+
+on:
+  pull_request:
+    paths:
+      - 'lib/**'
+      - 'apps/**/caddy.fragment'
+      - 'ingress/Caddyfile.template'
+      - 'tests/golden/**'
+      - '.github/workflows/render-test.yml'
+  push:
+    branches: [main]
+
+jobs:
+  caddyfile-render:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render Caddyfile against fixture configs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export VIBE_PREFIX="$PWD"
+
+          # Source the libs we need. Stub out the privileged-only helpers.
+          for fixture in mybooks "mybooks,connect" "mybooks,connect,tb" "mybooks,connect,tb,payroll"; do
+            slug="$(echo "$fixture" | tr ',' '-')"
+            tmp="$(mktemp -d)"
+            export VIBE_ETC="$tmp/etc/vibe"
+            export VIBE_DATA="$tmp/var/lib/vibe"
+            export VIBE_CONF="$VIBE_ETC/vibe.conf"
+            export VIBE_USER="$USER"
+
+            mkdir -p "$VIBE_ETC"
+
+            bash -c "
+              set -euo pipefail
+              source lib/common.sh
+              source lib/config.sh
+              source lib/secrets.sh
+              source lib/ingress.sh
+              source lib/apps.sh
+              require_root() { :; }
+              chown() { :; }
+              install() {
+                local args=()
+                while [ \$# -gt 0 ]; do
+                  case \"\$1\" in -o|-g|-m) shift 2 ;; *) args+=(\"\$1\"); shift ;; esac
+                done
+                command install \"\${args[@]}\"
+              }
+              config_init
+              config_set host vibe.local
+              config_set tls_mode internal
+              IFS=, read -ra apps <<< '$fixture'
+              for app in \"\${apps[@]}\"; do config_installed_add \"\$app\"; done
+              config_set mode multi
+              ingress_render_caddyfile
+            "
+
+            mkdir -p tests/golden
+            golden="tests/golden/Caddyfile.${slug}.golden"
+            rendered="$VIBE_ETC/ingress/Caddyfile"
+
+            if [ ! -f "$golden" ]; then
+              echo "(initializing golden) $golden"
+              cp "$rendered" "$golden"
+              continue
+            fi
+
+            if ! diff -u "$golden" "$rendered"; then
+              echo "::error::Caddyfile render drifted for fixture: $fixture"
+              echo "Update the golden if intentional: cp $rendered $golden"
+              exit 1
+            fi
+            echo "fixture '$fixture' matches golden"
+          done
+
+      - name: Upload goldens (initialization or drift)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caddyfile-renders
+          path: tests/golden/

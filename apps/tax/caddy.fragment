@@ -1,0 +1,43 @@
+# Vibe Tax Research Chat — Caddy route fragment.
+#
+# In multi-app mode the shared vibe-installer Caddy ingress reaches
+# tax-chat's api + web directly over the vibe_ingress network. Routes
+# here mirror the payroll fragment's shape with three differences:
+#
+#   1. The web container listens on :80 (not :8080) — its upstream
+#      nginx.conf binds 80 and the Dockerfile EXPOSEs 80.
+#   2. The api endpoint is `/api/health` (no `/v1/` prefix like
+#      payroll) — match the upstream Express router.
+#   3. The api strip removes only the /tax/ prefix (no /api/v1
+#      rewrite) — the upstream router expects `/api/...` directly.
+#
+# Health probe alias (operator + smoke test friendly): /tax/health →
+# api's /api/health.
+
+handle /tax/health {
+    rewrite * /api/health
+    reverse_proxy vibe-tax-api:4000
+}
+
+# API: bypass web entirely. /tax/api/foo → /api/foo → api:4000.
+# X-Forwarded-Prefix lets the api emit absolute URLs that include the
+# /tax/ prefix when needed (cookies, redirects, emailed links).
+handle_path /tax/api/* {
+    rewrite * /api{uri}
+    reverse_proxy vibe-tax-api:4000 {
+        header_up X-Forwarded-Prefix /tax
+    }
+}
+
+# SPA + static assets. The web container's runtime base-path hook has
+# already substituted /__VIBE_BASE_PATH__/ → /tax/ in the bundle, so
+# requests for /tax/assets/foo.js arrive here and Caddy strips the
+# /tax/ prefix before forwarding — the upstream nginx serves them
+# from /assets/foo.js relative to /usr/share/nginx/html.
+handle_path /tax/* {
+    reverse_proxy vibe-tax-web:80
+}
+
+handle /tax {
+    redir /tax/ permanent
+}
