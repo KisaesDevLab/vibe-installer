@@ -712,6 +712,9 @@ verify_install() {
     log "verifying install state..."
     local errs=0
 
+    # --- Required pieces (failure here is fatal) ---------------------
+    # These must exist for the appliance to be usable AT ALL — no apps
+    # can be installed without them.
     [ -f "$VIBE_ETC/vibe.conf" ] || { err "missing $VIBE_ETC/vibe.conf"; errs=$((errs+1)); }
     [ -L /usr/local/bin/vibe ]   || { err "missing symlink /usr/local/bin/vibe"; errs=$((errs+1)); }
     if ! docker network inspect "$VIBE_NETWORK" >/dev/null 2>&1; then
@@ -721,19 +724,31 @@ verify_install() {
          | grep -qx vibe-ingress-caddy; then
         err "ingress container vibe-ingress-caddy is not running"; errs=$((errs+1))
     fi
+
+    # --- Admin (graceful when the image isn't published) -------------
+    # Admin is the web management UI — convenient but not required.
+    # When ensure_admin set ADMIN_STACK_FAILED=1 (e.g. GHCR pull denied
+    # because upstream hasn't published the image yet), don't trip the
+    # fatal counter — print_next_steps already tells the operator the
+    # admin URL won't work, and the CLI is fully usable without it.
     [ -f "$VIBE_ETC/admin/.env" ] || { err "missing $VIBE_ETC/admin/.env"; errs=$((errs+1)); }
-    # Admin container can take a few seconds for postgres init + node boot
-    # after `up -d` returns. Poll briefly before giving up.
-    local deadline=$(( $(date +%s) + 30 )) admin_up=0
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        if docker ps --filter 'name=^vibe-admin-admin-1$' --format '{{.Names}}' \
-           | grep -qx vibe-admin-admin-1; then
-            admin_up=1
-            break
-        fi
-        sleep 2
-    done
-    [ "$admin_up" -eq 1 ] || { err "admin container vibe-admin-admin-1 is not running"; errs=$((errs+1)); }
+    if [ "${ADMIN_STACK_FAILED:-0}" = "1" ]; then
+        warn "admin: web UI not running — install completes, CLI still works"
+        warn "       (resolve the GHCR access issue then re-run install.sh)"
+    else
+        # Admin container can take a few seconds for postgres init + node boot
+        # after `up -d` returns. Poll briefly before giving up.
+        local deadline=$(( $(date +%s) + 30 )) admin_up=0
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if docker ps --filter 'name=^vibe-admin-admin-1$' --format '{{.Names}}' \
+               | grep -qx vibe-admin-admin-1; then
+                admin_up=1
+                break
+            fi
+            sleep 2
+        done
+        [ "$admin_up" -eq 1 ] || { err "admin container vibe-admin-admin-1 is not running"; errs=$((errs+1)); }
+    fi
 
     if [ "$errs" -gt 0 ]; then
         err "install did not reach a healthy state ($errs check(s) failed)"
