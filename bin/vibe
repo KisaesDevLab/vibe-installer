@@ -110,9 +110,13 @@ Lifecycle:
   uninstall --all           Tear down everything (with confirmation).
   upgrade <app> [--to VER]  Pull a new image tag and migrate.
   upgrade-check             List newer GHCR tags (read-only — never auto-applies).
-  report [<dir>]            Bundle install + cli logs, vibe state, container
+  report [--for-download] [<dir>]
+                            Bundle install + cli logs, vibe state, container
                             logs, redacted env files, and host info into a
                             single tarball for support triage.
+                            --for-download: drop in /tmp + mode 0644 + print
+                              the exact `scp` command (lets you copy off
+                              the box without sudo).
 
 Operational:
   logs <app> [service]      Tail container logs.

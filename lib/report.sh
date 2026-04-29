@@ -45,9 +45,31 @@ _capture() {
 report_bundle() {
     require_root || die "vibe report requires root (it reads /etc/vibe/* secrets to redact + bundle)"
 
-    local out_dir
-    out_dir="${1:-$REPORT_DIR_DEFAULT}"
-    install -d -m 0700 -o "$VIBE_USER" -g "$VIBE_USER" "$out_dir"
+    # Parse flags. The default output dir is /var/lib/vibe/.archive/ which
+    # is mode 0700 owned by `vibe` — fine for on-host inspection, but
+    # blocks an SSH user from `scp`-ing the file off the box without sudo.
+    # `--for-download` flips the output to /tmp/ + mode 0644, prints the
+    # exact scp command the operator should paste from their workstation.
+    local for_download=0 out_dir=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --for-download) for_download=1; shift ;;
+            -*) warn "ignoring unknown flag: $1"; shift ;;
+            *)  out_dir="$1"; shift ;;
+        esac
+    done
+
+    if [ "$for_download" = "1" ]; then
+        out_dir="${out_dir:-/tmp}"
+    else
+        out_dir="${out_dir:-$REPORT_DIR_DEFAULT}"
+    fi
+
+    if [ "$for_download" = "1" ] && [ "$out_dir" = "/tmp" ]; then
+        : # /tmp already exists with the right perms
+    else
+        install -d -m 0700 -o "$VIBE_USER" -g "$VIBE_USER" "$out_dir"
+    fi
 
     local ts staging tarball
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -195,17 +217,48 @@ EOF
 
     log "tarring up..."
     ( cd "$staging" && tar -czf "$tarball" . )
-    chown "$VIBE_USER:$VIBE_USER" "$tarball" 2>/dev/null || true
-    chmod 0600 "$tarball"
     rm -rf "$staging"
+
+    if [ "$for_download" = "1" ]; then
+        # SSH-download path: world-readable so `scp adminvibe@host:...`
+        # works without sudo. Secrets are already redacted in the bundle,
+        # so 0644 doesn't expand the attack surface beyond on-host
+        # inspection — anyone who can read /tmp could already see
+        # everything in /etc/vibe/*/.env directly.
+        chmod 0644 "$tarball"
+    else
+        chown "$VIBE_USER:$VIBE_USER" "$tarball" 2>/dev/null || true
+        chmod 0600 "$tarball"
+    fi
 
     echo
     ok "report bundled to:"
     echo "    $tarball"
     echo "    size: $(du -h "$tarball" | cut -f1)"
     echo
-    log "send this file when you ask for help — it answers most triage questions in one shot."
-    log "to inspect locally before sending:"
-    log "  tar -tzf $tarball | head        # list contents"
-    log "  tar -xzf $tarball -C /tmp/r/    # extract"
+    if [ "$for_download" = "1" ]; then
+        # Detect the appliance's primary IPv4 so we can pre-fill the scp
+        # example. Falls back to <host> placeholder if detection fails.
+        local ip
+        ip="$(ip -4 -o addr show scope global 2>/dev/null \
+              | awk '{ split($4, a, "/"); print a[1]; exit }' || true)"
+        [ -z "$ip" ] && ip="<appliance-ip>"
+        local user="${SUDO_USER:-<your-ssh-user>}"
+        echo
+        log "to download from your workstation, paste either of these:"
+        echo
+        echo "    # scp (any platform with OpenSSH client):"
+        echo "    scp ${user}@${ip}:${tarball} ."
+        echo
+        echo "    # rsync (resumable; useful for large bundles):"
+        echo "    rsync -avzP ${user}@${ip}:${tarball} ."
+        echo
+        log "after the file is on your workstation, you can clean it up here:"
+        echo "    rm ${tarball}"
+    else
+        log "send this file when you ask for help — it answers most triage questions in one shot."
+        log "to download from SSH (file is mode 0600, owned by ${VIBE_USER}):"
+        log "  re-run with the --for-download flag, OR"
+        log "  ssh <user>@<host> \"sudo cat ${tarball}\" > vibe-report.tar.gz"
+    fi
 }
