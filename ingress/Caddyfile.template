@@ -2,6 +2,18 @@
 @@EMAIL_LINE@@
     # Off-default admin API. We re-render + reload by SIGHUPing the container.
     admin off
+
+    # Fall back to the {$VIBE_HOST} cert when the TLS ClientHello has no
+    # SNI or has an SNI Caddy can't match (most commonly: a client
+    # connecting via the LAN IP literal — `https://192.168.x.x/`). Caddy's
+    # auto-generated TLS connection policies match by hostname-style SNI
+    # only and silently reject IP-as-SNI, even when `tls internal` has
+    # already issued a cert for the IP. Without this, a browser hitting
+    # the appliance via its LAN IP fails the TLS handshake instead of
+    # showing the usual self-signed-cert warning. The cert it gets
+    # reports {$VIBE_HOST} as its subject — that's a one-click bypass
+    # in every modern browser, same UX as the existing self-signed flow.
+    default_sni {$VIBE_HOST}
 }
 
 # =====================================================================
