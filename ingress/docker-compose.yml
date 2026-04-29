@@ -34,9 +34,13 @@ services:
     networks:
       - vibe_ingress
     healthcheck:
-      # Caddy's admin API (off by default in our config) isn't available;
-      # the cheapest health probe is hitting the landing page.
-      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || wget -qO- http://127.0.0.1:80/_caddy_alive >/dev/null 2>&1 || exit 1']
+      # Caddy auto-redirects HTTP → HTTPS for any configured site, so
+      # probing port 80 always returns 308 and wget exits non-zero.
+      # Probe HTTPS directly with --no-check-certificate (the local
+      # `tls internal` cert isn't in the container's trust store) and
+      # a Host: header that matches the configured site so we hit the
+      # /healthz route Caddyfile.template defines.
+      test: ['CMD-SHELL', 'wget --no-check-certificate -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- https://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok"']
       interval: 30s
       timeout: 5s
       retries: 3

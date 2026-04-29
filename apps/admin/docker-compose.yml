@@ -54,6 +54,16 @@ services:
       - '4500'
     ports:
       - '${ADMIN_PUBLISH_PORT:-4500}:4500'
+    # The container runs as `vibeadmin` (UID 10001) per the upstream
+    # Dockerfile. Adding the host's `vibe` group as a supplementary
+    # group lets the container read group-readable files under
+    # /etc/vibe/admin/ (the bootstrap password) and write to the
+    # /run/vibed.sock socket (mode 0660, group `vibe`). VIBE_GID is
+    # written into /etc/vibe/admin/.env by install.sh from `id -g vibe`
+    # on the host so this stays correct across machines that allocate
+    # different system GIDs.
+    group_add:
+      - '${VIBE_GID:-987}'
     volumes:
       - /run/vibed.sock:/run/vibed.sock:rw
       - /etc/vibe/admin/admin-bootstrap.password:/etc/vibe/admin/admin-bootstrap.password:rw

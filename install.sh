@@ -732,9 +732,14 @@ ensure_admin() {
         chmod 0600 "$etc/postgres_password"
 
         # Bootstrap password (read by the server on first boot).
+        # 0640 + group `vibe` so the admin container (uid 10001,
+        # supplementary group `vibe` via docker-compose group_add) can
+        # readFile() it on its first boot. /etc/vibe/admin itself is
+        # mode 0750 owned vibe:vibe, so non-vibe non-root host users
+        # still can't list or open the bootstrap file.
         printf '%s' "$admin_pw" > "$etc/admin-bootstrap.password"
         chown "$VIBE_USER:$VIBE_USER" "$etc/admin-bootstrap.password"
-        chmod 0600 "$etc/admin-bootstrap.password"
+        chmod 0640 "$etc/admin-bootstrap.password"
 
         # Operator-readable cleartext copy. Root-only so a non-root
         # user on the host can't sudo-less it.
@@ -744,12 +749,16 @@ ensure_admin() {
         chown root:root "$VIBE_LOG/admin-initial-password.txt"
 
         : "${VIBE_ADMIN_VERSION:=latest}"
+        local vibe_gid; vibe_gid="$(id -g "$VIBE_USER")"
         # Render env.template. The session secret is for express-session
-        # signing; the postgres password gets inlined into DATABASE_URL.
+        # signing; the postgres password gets inlined into DATABASE_URL;
+        # VIBE_GID is read by docker-compose's group_add so the admin
+        # container can access vibe-group-owned host files/sockets.
         sed \
             -e "s|@SESSION_SECRET@|${session}|g" \
             -e "s|@POSTGRES_PASSWORD@|${pg}|g" \
             -e "s|@VIBE_ADMIN_VERSION@|${VIBE_ADMIN_VERSION}|g" \
+            -e "s|@VIBE_GID@|${vibe_gid}|g" \
             "$VIBE_PREFIX/apps/admin/env.template" > "$env_path"
         chown "$VIBE_USER:$VIBE_USER" "$env_path"
         chmod 0600 "$env_path"
@@ -765,6 +774,26 @@ ensure_admin() {
             grep -nE '@[A-Z][A-Z0-9_]*@' "$env_path" >&2
             die "admin: $env_path still contains @PLACEHOLDER@ tokens — secret render failed"
         fi
+    fi
+
+    # ---- Self-heal block (runs on EVERY ensure_admin call) -----------
+    # The early-exit above is "leave the env untouched" — but two things
+    # in this file's history weren't there originally and need to be
+    # backfilled on re-run for an existing appliance. Both are
+    # idempotent: they no-op if the state is already correct.
+    #
+    #   1. VIBE_GID line in /etc/vibe/admin/.env (added 2026-04: lets
+    #      the admin container read its bootstrap password + write to
+    #      /run/vibed.sock via supplementary group).
+    #   2. Bootstrap password file mode 0640 (was 0600 before the same
+    #      change — unreadable inside the container).
+    if ! grep -qE '^VIBE_GID=' "$env_path" 2>/dev/null; then
+        local _backfill_gid; _backfill_gid="$(id -g "$VIBE_USER")"
+        printf '\n# Backfilled by install.sh re-run.\nVIBE_GID=%s\n' "$_backfill_gid" >> "$env_path"
+        log "backfilled VIBE_GID=${_backfill_gid} into $env_path"
+    fi
+    if [ -f "$etc/admin-bootstrap.password" ]; then
+        chmod 0640 "$etc/admin-bootstrap.password" 2>/dev/null || true
     fi
 
     # Resolve the host the admin stack should advertise in SITE_URL etc.
