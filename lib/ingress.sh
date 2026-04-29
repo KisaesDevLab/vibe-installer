@@ -17,9 +17,12 @@ INGRESS_COMPOSE="${VIBE_PREFIX}/ingress/docker-compose.yml"
 INGRESS_TEMPLATE="${VIBE_PREFIX}/ingress/Caddyfile.template"
 
 # ---------- Path helpers ----------
-ingress_caddyfile_path() { printf '%s/Caddyfile\n' "$INGRESS_ETC"; }
-ingress_envfile_path()   { printf '%s/.env\n'      "$INGRESS_ETC"; }
-ingress_installed_json() { printf '%s/ingress/landing/__vibe_installed.json\n' "$VIBE_PREFIX"; }
+ingress_caddyfile_path()      { printf '%s/Caddyfile\n' "$INGRESS_ETC"; }
+ingress_envfile_path()        { printf '%s/.env\n'      "$INGRESS_ETC"; }
+ingress_landing_dir()         { printf '%s/ingress/landing\n' "$VIBE_PREFIX"; }
+ingress_installed_json()      { printf '%s/__vibe_installed.json\n'      "$(ingress_landing_dir)"; }
+ingress_appliance_json()      { printf '%s/__vibe_appliance.json\n'      "$(ingress_landing_dir)"; }
+ingress_upgrade_check_json()  { printf '%s/__vibe_upgrade_check.json\n'  "$(ingress_landing_dir)"; }
 
 # ---------- Directory + env file setup ----------
 ingress_ensure_dirs() {
@@ -135,20 +138,12 @@ ingress_render_caddyfile() {
         *) die "unknown tls_mode: $tls (expected internal|acme|cf-tunnel)" ;;
     esac
 
-    # 2. Concatenate per-app fragments. Two sources:
-    #    - The system admin app (apps/admin/) — always included if the
-    #      fragment exists. install.sh drops the admin stack alongside
-    #      the ingress; it isn't part of the user-driven `installed=`
-    #      list because it isn't optional.
-    #    - User apps from config_installed_list — what `vibe install`
-    #      added.
+    # 2. Concatenate per-app fragments from config_installed_list — what
+    # `vibe install` added. The admin SPA's caddy.fragment used to be
+    # always-included here pre-2026-04; it was dropped along with the
+    # whole admin stack (replaced by the static operator panel on the
+    # landing page).
     local fragments="" frag app
-    local admin_frag="${VIBE_PREFIX}/apps/admin/caddy.fragment"
-    if [ -f "$admin_frag" ]; then
-        fragments+=$'\n    # ---- admin (system) ----\n'
-        fragments+="$(sed 's/^/    /' "$admin_frag")"
-        fragments+=$'\n'
-    fi
     for app in $(config_installed_list); do
         frag="${VIBE_PREFIX}/apps/${app}/caddy.fragment"
         if [ -f "$frag" ]; then
@@ -180,8 +175,10 @@ ingress_render_caddyfile() {
     # tripped this check.
     ingress_validate_caddyfile "$out"
 
-    # Update the installed-apps JSON the landing page reads.
+    # Update the JSON feeds the landing page reads. Both are cheap +
+    # idempotent; no reason not to refresh on every Caddyfile render.
     ingress_render_installed_json
+    ingress_render_appliance_json
 
     ok "ingress: rendered ${out} (host=${host}, tls=${tls})"
 }
@@ -269,6 +266,111 @@ ingress_render_installed_json() {
     apps_json+="]"
     printf '{"apps":%s,"generated":%s}\n' "$apps_json" "$(date +%s)" > "$out"
     chmod 0644 "$out"
+}
+
+# JSON consumed by the landing page's operator panel. Carries the SSH
+# connection bits + version metadata so the panel can render
+# copy-pasteable commands like `ssh ${ssh_user}@${host}` without the
+# operator having to remember them.
+#
+# ssh_user comes from vibe.conf when set (install.sh writes it from
+# ${SUDO_USER:-$(logname)} during render_config). Falls back to
+# $SUDO_USER, then to "vibe" — last-resort default that matches the
+# system user the installer creates anyway, so the snippet is at worst
+# a useful starting point.
+ingress_render_appliance_json() {
+    local out
+    out="$(ingress_appliance_json)"
+    local host host_ip tls ssh_user vibe_version
+    host="$(config_get host)"
+    [ -z "$host" ] && host="vibe.local"
+    host_ip="$(config_get host_ip)"
+    tls="$(config_get tls_mode)"
+    [ -z "$tls" ] && tls="internal"
+    ssh_user="$(config_get ssh_user)"
+    [ -z "$ssh_user" ] && ssh_user="${SUDO_USER:-vibe}"
+    # Pull from bin/vibe so we don't drift from the CLI's reported version.
+    # `vibe version` is the simplest path; falls back to grepping the script
+    # if the binary isn't on PATH yet (mid-install).
+    if has_cmd vibe; then
+        vibe_version="$(vibe version 2>/dev/null || true)"
+    fi
+    if [ -z "$vibe_version" ] && [ -f "${VIBE_PREFIX}/bin/vibe" ]; then
+        vibe_version="$(grep -E '^VIBE_VERSION=' "${VIBE_PREFIX}/bin/vibe" | head -1 | cut -d'"' -f2)"
+    fi
+    [ -z "$vibe_version" ] && vibe_version="unknown"
+
+    printf '{"host":"%s","host_ip":"%s","ssh_user":"%s","vibe_version":"%s","tls_mode":"%s","generated":%s}\n' \
+        "$host" "$host_ip" "$ssh_user" "$vibe_version" "$tls" "$(date +%s)" > "$out"
+    chmod 0644 "$out"
+}
+
+# Refresh /__vibe_upgrade_check.json from `vibe upgrade-check --json`.
+# Wraps the CLI output with two top-level fields the SPA needs:
+#
+#   checked_at       — Unix ts of THIS run, regardless of success
+#   last_success_at  — Unix ts of the last fully-successful check
+#
+# When the current check fails (no GHCR connectivity, malformed output,
+# all per-app entries reporting `offline`/`no-ghcr`), the wrapper
+# preserves the previous `apps[]` array and updates only `checked_at`.
+# Landing page reads `last_success_at` to render "(check failed; last
+# good data N hours old)" inline. Failures never wipe the previous
+# good snapshot.
+ingress_refresh_upgrade_check() {
+    require_root
+    local out tmp now prev raw apps_json="" success=0
+    out="$(ingress_upgrade_check_json)"
+    tmp="$(mktemp)"
+    now="$(date +%s)"
+
+    # Best-effort call. Don't `die` on failure — we want to be able to
+    # update only the timestamp.
+    raw="$("${VIBE_PREFIX}/bin/vibe" upgrade-check --json 2>/dev/null || true)"
+    if [ -n "$raw" ] && printf '%s' "$raw" | grep -q '"apps":\['; then
+        # Strip the closing `}` so we can append our two timestamp
+        # fields without parsing/re-serializing JSON. The input is
+        # `{"apps":[...]}` with no whitespace (per update_check.sh).
+        apps_json="$(printf '%s' "$raw" | sed -E 's/}$//')"
+
+        # "success" means at least one app entry has a non-failure
+        # status. If every entry is offline/no-ghcr the operator gets
+        # nothing useful from THIS run; treat it as a failure so we
+        # don't overwrite a previous good snapshot.
+        if printf '%s' "$raw" | grep -qE '"status":"(current|outdated|unpinned|ahead|no-tags)"'; then
+            success=1
+        fi
+    fi
+
+    if [ "$success" -eq 1 ]; then
+        printf '%s,"checked_at":%s,"last_success_at":%s}\n' \
+            "$apps_json" "$now" "$now" > "$tmp"
+    else
+        # Preserve the previous apps[] + last_success_at. If there's no
+        # previous file at all (first run, GHCR unreachable), emit an
+        # empty apps[] and last_success_at=0 so the SPA can render
+        # "no successful check yet".
+        local prev_apps='"apps":[]' prev_success=0
+        if [ -f "$out" ]; then
+            prev="$(cat "$out")"
+            local extracted
+            extracted="$(printf '%s' "$prev" | grep -oE '"apps":\[[^]]*\]' | head -1)"
+            [ -n "$extracted" ] && prev_apps="$extracted"
+            local extracted_ts
+            extracted_ts="$(printf '%s' "$prev" | grep -oE '"last_success_at":[0-9]+' | head -1 | cut -d: -f2)"
+            [ -n "$extracted_ts" ] && prev_success="$extracted_ts"
+        fi
+        printf '{%s,"checked_at":%s,"last_success_at":%s}\n' \
+            "$prev_apps" "$now" "$prev_success" > "$tmp"
+    fi
+
+    install -m 0644 "$tmp" "$out"
+    rm -f "$tmp"
+    if [ "$success" -eq 1 ]; then
+        ok "ingress: upgrade-check refreshed ($out)"
+    else
+        warn "ingress: upgrade-check failed (offline / no-ghcr) — preserved previous data"
+    fi
 }
 
 # ---------- Compose lifecycle ----------

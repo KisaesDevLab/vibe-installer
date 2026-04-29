@@ -123,6 +123,9 @@ Operational:
   restore <app> <tarball>   Restore from a previous backup tarball.
   ingress preview           Render the Caddyfile + run caddy validate
                             without touching the live config.
+  ingress refresh-updates   Re-run upgrade-check now and refresh the
+                            landing page's update badges (otherwise
+                            refreshed daily by vibe-upgrade-check.timer).
 
 Auth & secrets:
   license set <app> <token>          Replace an app's license token.
@@ -254,9 +257,6 @@ cmd_cloudflare() {
         clear)     shift; cloudflare_clear_stash "$@" ;;
         status)    shift; cloudflare_status "$@" ;;
         logs)      shift; cloudflare_logs "$@" ;;
-        # Deprecated — kept so muscle memory still works.
-        attach)    shift; cloudflare_attach "$@" ;;
-        detach)    shift; cloudflare_detach "$@" ;;
         ""|help)   printf 'usage: vibe cloudflare {set-token|clear|status|logs} [<token>]\n' ;;
         *) err "unknown cloudflare subcommand: $1"; return 64 ;;
     esac
@@ -264,8 +264,9 @@ cmd_cloudflare() {
 
 cmd_ingress() {
     case "${1:-}" in
-        preview) shift; ingress_preview_caddyfile "$@" ;;
-        ""|help) printf 'usage: vibe ingress {preview}\n' ;;
+        preview)         shift; ingress_preview_caddyfile "$@" ;;
+        refresh-updates) shift; ingress_refresh_upgrade_check "$@" ;;
+        ""|help)         printf 'usage: vibe ingress {preview|refresh-updates}\n' ;;
         *) err "unknown ingress subcommand: $1"; return 64 ;;
     esac
 }

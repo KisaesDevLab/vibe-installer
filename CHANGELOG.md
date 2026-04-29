@@ -1,5 +1,94 @@
 # Changelog
 
+## v1.16.0 — Unreleased (drop admin SPA + vibed; static operator panel)
+
+### Removed — admin SPA, vibed daemon, bootstrap-password plumbing
+
+The `/admin/` browser-based control panel (the `Vibe-Admin` SPA + the
+Go `vibed` JSON-RPC daemon) is gone. Their job — letting an operator
+manage the appliance from a browser — is now done by a static
+"operator panel" section on the landing page at `/`. The panel shows:
+
+1. App tiles (existed already), now with an "↑ <version>" badge for
+   apps with newer GHCR tags available
+2. SSH header showing `ssh <user>@<host>` with a copy button
+3. "Updates last checked Xh ago" indicator (with a graceful
+   "(check failed; last good data N hours old)" note on transient
+   GHCR outages)
+4. Per-app collapsible cards listing copy-pasteable commands —
+   `sudo vibe upgrade`, `sudo vibe logs`, `sudo vibe backup`, etc. —
+   defaulting to collapsed; one card per supported app whether
+   installed or not
+5. Always-expanded Diagnostics card with `vibe doctor`, `vibe status`,
+   `vibe report --for-download`
+
+Everything that mutates state (install/upgrade/uninstall, set tokens)
+is now CLI-only. The landing page is purely informational, no auth
+needed because nothing on it is sensitive — anyone with browser
+access could already reach the product apps; the page just shows
+the *commands* an authenticated operator would run over SSH.
+
+**Breaking for external RPC consumers.** Anything outside this repo
+that talked to `/run/vibed.sock` or called `cloudflare.attach`/etc.
+methods stops working. The Vibe-Admin source repo can be archived.
+
+### Added
+
+- **`lib/ingress.sh::ingress_render_appliance_json`** — writes
+  `/__vibe_appliance.json` with host, host_ip, ssh_user, vibe_version,
+  tls_mode. Called on every Caddyfile render.
+- **`lib/ingress.sh::ingress_refresh_upgrade_check`** — wraps
+  `vibe upgrade-check --json`, adds `checked_at` + `last_success_at`
+  fields, preserves the previous good `apps[]` snapshot when GHCR is
+  unreachable.
+- **`vibe ingress refresh-updates`** — manual trigger for the wrapper above.
+- **`etc/systemd/system/vibe-upgrade-check.{service,timer}`** — daily
+  refresh of the upgrade-check JSON. `OnBootSec=5min`,
+  `OnUnitActiveSec=24h`, `Persistent=true`. Installed + enabled by
+  `install.sh::ensure_upgrade_check_timer`.
+- **`vibe.conf` `ssh_user=` field** — written by `install.sh` from
+  `${SUDO_USER:-$(logname)}`. Surfaces in the landing page's SSH
+  command snippet. Backfilled on re-run for existing installs.
+- **`install.sh::migrate_drop_admin`** — idempotent teardown of the
+  pre-2026-04 admin stack on re-install. Stops + removes the
+  `vibe-admin` compose project (with `--volumes` — postgres data
+  goes), removes `/etc/vibe/admin/` + `/var/lib/vibe/admin/`,
+  disables + removes `vibed.service` and the `/usr/local/bin/vibed`
+  binary, removes `/run/vibed.sock`. **No prompt; no archive.**
+
+### Removed (file/directory deletions)
+
+- `apps/admin/` (whole directory)
+- `tools/vibed/` (whole directory)
+- `etc/systemd/system/vibed.service`
+- `install.sh::ensure_admin`, `mint_admin_password`,
+  `ADMIN_INITIAL_PASSWORD`, `ADMIN_STACK_FAILED`, the post-install
+  admin URL+password block in `print_next_steps`
+- `install.sh::ensure_vibed` (the binary fetcher)
+- `lib/ingress.sh`'s admin-fragment auto-include block
+- `lib/update_check.sh`'s admin special-case in
+  `update_check_run_json` and the `admin → vibe-admin` entry in
+  `update_check_image`
+- `bin/vibe`'s deprecated `cloudflare attach`/`detach` shims (no
+  callers left now that the admin SPA is gone)
+- `lib/cloudflare.sh::cloudflare_attach`/`cloudflare_detach` shims
+
+### Migration
+
+Operators upgrading from a state with the admin running:
+
+1. Re-run `install.sh`. `migrate_drop_admin` runs early, before
+   anything else touches the appliance.
+2. The previous `vibe-admin-*` containers stop + are removed; their
+   postgres volume + `/var/lib/vibe/admin/` data are deleted (audit
+   log history is wiped). If you need that history, `pg_dump` it
+   yourself before running.
+3. `vibed.service` is disabled and removed; the binary at
+   `/usr/local/bin/vibed` is deleted.
+4. The new `vibe-upgrade-check.timer` is installed and enabled.
+5. Open `https://<host>/` — the operator panel is in place of the
+   old `/admin/`.
+
 ## v1.15.0 — Unreleased (single-ingress cf-tunnel refactor)
 
 ### Changed — Cloudflare Tunnel is now per-ingress, not per-app

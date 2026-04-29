@@ -2,9 +2,13 @@
     --bg: #0f172a;
     --surface: #1e293b;
     --surface-hover: #334155;
+    --surface-2: #0b1220;
     --text: #f1f5f9;
     --text-dim: #94a3b8;
     --accent: #60a5fa;
+    --accent-2: #fbbf24;
+    --ok: #34d399;
+    --warn: #f59e0b;
     --border: rgba(255, 255, 255, 0.08);
     --radius: 12px;
 }
@@ -14,7 +18,7 @@
 body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
-    background: linear-gradient(180deg, #0b1220 0%, var(--bg) 100%);
+    background: linear-gradient(180deg, var(--surface-2) 0%, var(--bg) 100%);
     color: var(--text);
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
@@ -43,6 +47,7 @@ h1 {
     font-size: 1.05rem;
 }
 
+/* ---------- Tiles ---------- */
 .tiles {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -51,6 +56,7 @@ h1 {
 }
 
 .tile {
+    position: relative;
     display: block;
     padding: 1.5rem;
     background: var(--surface);
@@ -84,6 +90,202 @@ h1 {
     font-size: 0.92rem;
 }
 
+.tile__badge {
+    position: absolute;
+    top: 0.75rem;
+    right: 0.75rem;
+    background: var(--accent-2);
+    color: #000;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    letter-spacing: 0.02em;
+}
+
+/* ---------- Operator panel ---------- */
+.ops {
+    margin-bottom: 3rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+}
+
+.ops__header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+}
+
+.ops h2 {
+    margin: 0 0 0.4rem;
+    font-size: 1.15rem;
+}
+
+.ops__ssh {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.92rem;
+}
+
+.ops__ssh code {
+    background: var(--surface-2);
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+    font-size: 0.92em;
+    margin: 0 0.4rem;
+}
+
+.ops__updates {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    text-align: right;
+    line-height: 1.4;
+}
+
+.ops__warn {
+    display: block;
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    margin-top: 0.2rem;
+}
+
+.ops__toolbar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.ops__toolbar button {
+    background: var(--surface-2);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+    font-family: inherit;
+}
+
+.ops__toolbar button:hover {
+    background: var(--surface-hover);
+    color: var(--text);
+}
+
+/* ---------- Collapsible cards ---------- */
+.ops-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+}
+
+.ops-card summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 0.75rem 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    user-select: none;
+}
+
+.ops-card summary::-webkit-details-marker { display: none; }
+
+.ops-card summary::after {
+    content: '▸';
+    margin-left: auto;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    transition: transform 0.15s ease;
+}
+
+.ops-card[open] summary::after {
+    transform: rotate(90deg);
+}
+
+.ops-card summary:hover {
+    background: var(--surface-hover);
+}
+
+.ops-card__icon {
+    font-size: 1.2rem;
+}
+
+.ops-card__name {
+    font-weight: 500;
+}
+
+/* Status pill at the right of the summary (before the chevron). */
+.pill {
+    margin-left: auto;
+    margin-right: 0.4rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    padding: 0.15rem 0.6rem;
+    border-radius: 999px;
+    letter-spacing: 0.02em;
+}
+
+.pill--on  { background: rgba(52, 211, 153, 0.18); color: var(--ok); }
+.pill--off { background: rgba(148, 163, 184, 0.15); color: var(--text-dim); }
+.pill--upd { background: rgba(251, 191, 36, 0.2); color: var(--accent-2); }
+
+.ops-card__body {
+    padding: 0.5rem 1rem 1rem;
+    border-top: 1px solid var(--border);
+}
+
+.cmd {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 0;
+}
+
+.cmd code {
+    flex: 1;
+    background: var(--bg);
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    color: var(--text);
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.cmd--hl code {
+    border: 1px solid var(--accent-2);
+    background: rgba(251, 191, 36, 0.06);
+}
+
+.copy-btn {
+    background: var(--surface);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.3rem 0.65rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+    font-family: inherit;
+    flex-shrink: 0;
+}
+
+.copy-btn:hover {
+    background: var(--surface-hover);
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+/* ---------- Footer ---------- */
 footer {
     text-align: center;
     color: var(--text-dim);

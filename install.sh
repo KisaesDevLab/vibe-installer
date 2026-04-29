@@ -480,8 +480,8 @@ EOM
 render_config() {
     local conf="$VIBE_ETC/vibe.conf"
     if [ -f "$conf" ]; then
-        # Existing config — only fill in host_ip if it's empty AND we
-        # detected one. Otherwise leave the operator's edits untouched.
+        # Existing config — backfill host_ip and ssh_user if missing,
+        # leave everything else untouched (operator may have edited).
         local existing_ip
         existing_ip="$(grep -E '^host_ip=' "$conf" 2>/dev/null | cut -d= -f2)"
         if [ -z "$existing_ip" ]; then
@@ -494,12 +494,18 @@ render_config() {
                     printf 'host_ip=%s\n' "$detected_ip" >> "$conf"
                 fi
                 ok "config $conf — added host_ip=${detected_ip} (was missing)"
-            else
-                ok "config $conf exists — leaving untouched"
             fi
-        else
-            ok "config $conf exists — leaving untouched"
         fi
+        if ! grep -qE '^ssh_user=' "$conf" 2>/dev/null; then
+            local backfill_user="${SUDO_USER:-}"
+            if [ -z "$backfill_user" ] && command -v logname >/dev/null 2>&1; then
+                backfill_user="$(logname 2>/dev/null || true)"
+            fi
+            [ -z "$backfill_user" ] && backfill_user="vibe"
+            printf 'ssh_user=%s\n' "$backfill_user" >> "$conf"
+            ok "config $conf — added ssh_user=${backfill_user} (was missing)"
+        fi
+        ok "config $conf exists — backfilled missing fields, left rest untouched"
         return 0
     fi
     log "rendering $conf..."
@@ -515,9 +521,20 @@ render_config() {
     local host_ip=""
     host_ip="$(primary_ipv4 || true)"
 
+    # SSH user surfaced in the landing page's operator panel. Pick the
+    # invoking operator (sudo) so the snippet works out of the box; fall
+    # back to logname (real user even when sudo USER is `root`); fall
+    # back to "vibe" so we never leave the field blank.
+    local ssh_user="${SUDO_USER:-}"
+    if [ -z "$ssh_user" ] && command -v logname >/dev/null 2>&1; then
+        ssh_user="$(logname 2>/dev/null || true)"
+    fi
+    [ -z "$ssh_user" ] || [ "$ssh_user" = "root" ] && ssh_user="${ssh_user:-vibe}"
+
     install -m 0644 "$VIBE_PREFIX/etc/vibe.conf.template" "$conf"
     sed -i "s|^host=.*|host=${VIBE_HOST_PICK}|"          "$conf"
     sed -i "s|^host_ip=.*|host_ip=${host_ip}|"           "$conf"
+    sed -i "s|^ssh_user=.*|ssh_user=${ssh_user}|"        "$conf"
     sed -i "s|^tls_mode=.*|tls_mode=${VIBE_TLS_MODE_PICK}|" "$conf"
     sed -i "s|^acme_email=.*|acme_email=${VIBE_ACME_EMAIL_PICK}|" "$conf"
     chown "$VIBE_USER:$VIBE_USER" "$conf"
@@ -553,319 +570,93 @@ ensure_ingress() {
     fi
 }
 
-# ---------- Install the vibed daemon ----------
-# vibed is the JSON-RPC daemon that the admin web app talks to. The
-# binary acquisition strategy walks four sources in order, falling
-# through cleanly until something works:
+# ---------- Install the vibe-upgrade-check systemd timer ----------
+# Drives the daily refresh of the landing page's "update available"
+# data. See lib/ingress.sh::ingress_refresh_upgrade_check + the unit
+# files at etc/systemd/system/vibe-upgrade-check.{service,timer}.
 #
-#   1. Pinned release tag — download from
-#      releases/download/${VIBE_REF}/vibed-linux-<arch>. Works for
-#      tagged refs (e.g. v0.1.0). 404s when VIBE_REF is a branch name.
-#   2. `latest` release — download from releases/latest/download/.
-#      Picks up whatever the most recent v* tag published. Works for
-#      curl|bash from `main` once at least one release exists.
-#   3. Pre-built local binary at tools/vibed/vibed (developer convenience).
-#   4. Source build — apt-install golang-go (if not present), cd into
-#      tools/vibed, `go build`. vibed is stdlib-only so no module
-#      fetches and no go.sum to honor; build is ~30s on a small box.
-#
-# Step 4 means a curl|bash from `main` always produces a working daemon,
-# even before the first vibe-installer release tag is cut.
-ensure_vibed() {
-    local arch_tag
-    case "$(uname -m)" in
-        x86_64|amd64) arch_tag="linux-amd64" ;;
-        aarch64|arm64) arch_tag="linux-arm64" ;;
-        *) warn "vibed: unsupported architecture $(uname -m); skipping"; return 0 ;;
-    esac
+# Idempotent: re-running install.sh re-installs the units and re-enables
+# the timer, but doesn't reset its OnBootSec / OnUnitActiveSec schedule.
+ensure_upgrade_check_timer() {
+    local svc="vibe-upgrade-check"
+    local svc_target="/etc/systemd/system/${svc}.service"
+    local timer_target="/etc/systemd/system/${svc}.timer"
+    local svc_source="$VIBE_PREFIX/etc/systemd/system/${svc}.service"
+    local timer_source="$VIBE_PREFIX/etc/systemd/system/${svc}.timer"
 
-    local binary_target="/usr/local/bin/vibed"
-    local unit_target="/etc/systemd/system/vibed.service"
-    local unit_source="$VIBE_PREFIX/etc/systemd/system/vibed.service"
-    local src_dir="$VIBE_PREFIX/tools/vibed"
-
-    if [ -x "$binary_target" ]; then
-        ok "vibed binary present at $binary_target"
-    else
-        local source="" tmp="$binary_target.tmp"
-        rm -f "$tmp" 2>/dev/null || true
-
-        # 1. Tag-pinned release artifact.
-        local pin_url="https://github.com/KisaesDevLab/vibe-installer/releases/download/${VIBE_REF}/vibed-${arch_tag}"
-        if curl -fsSL --max-time 30 "$pin_url" -o "$tmp" 2>/dev/null; then
-            source="release ($VIBE_REF)"
-        # 2. Latest-release fallback (covers curl|bash from `main`).
-        elif curl -fsSL --max-time 30 \
-              "https://github.com/KisaesDevLab/vibe-installer/releases/latest/download/vibed-${arch_tag}" \
-              -o "$tmp" 2>/dev/null; then
-            source="release (latest)"
-        # 3. Pre-built local binary (developer dropped one in).
-        elif [ -x "$src_dir/vibed" ]; then
-            install -m 0755 "$src_dir/vibed" "$tmp"
-            source="local pre-built binary at $src_dir/vibed"
-        # 4. Source build — last resort but reliably works on any host.
-        else
-            log "vibed: no release artifact for ${VIBE_REF} or :latest, building from source..."
-            if ! command -v go >/dev/null 2>&1; then
-                log "vibed: installing golang-go via apt (one-time, ~200 MB)..."
-                if ! apt-get install -y --no-install-recommends golang-go >/dev/null 2>&1; then
-                    warn "vibed: apt-get install golang-go failed — admin UI buttons won't work"
-                    warn "vibed: try manually: sudo apt-get install -y golang-go"
-                    rm -f "$tmp" 2>/dev/null || true
-                fi
-            fi
-            if command -v go >/dev/null 2>&1 && [ -d "$src_dir" ]; then
-                log "vibed: building (vibed is stdlib-only, ~30s)..."
-                if ( cd "$src_dir" && \
-                     CGO_ENABLED=0 go build \
-                       -trimpath \
-                       -ldflags "-s -w -X main.VibedVersion=${VIBE_REF}-source" \
-                       -o "$tmp" . ); then
-                    chmod 0755 "$tmp"
-                    source="source build (Go $(go version | awk '{print $3}'))"
-                else
-                    warn "vibed: go build failed — admin UI buttons won't work"
-                    warn "vibed: see $src_dir for build errors"
-                    rm -f "$tmp" 2>/dev/null || true
-                fi
-            elif [ ! -d "$src_dir" ]; then
-                warn "vibed: source missing at $src_dir — admin UI buttons won't work"
-            fi
-        fi
-
-        if [ -n "$source" ] && [ -f "$tmp" ]; then
-            install -m 0755 "$tmp" "$binary_target"
-            rm -f "$tmp"
-            ok "vibed: installed from ${source}"
-        else
-            warn "vibed: binary unavailable — CLI works fine; admin UI's product-management"
-            warn "       actions will fail until vibed is on disk. Recover with:"
-            warn "         sudo apt-get install -y golang-go"
-            warn "         sudo bash -c 'cd $src_dir && CGO_ENABLED=0 go build -o /usr/local/bin/vibed .'"
-            warn "         sudo systemctl restart vibed"
-        fi
-    fi
-
-    # Install the systemd unit even if the binary is missing — that way
-    # `systemctl restart vibed` works the moment the operator drops a
-    # binary in place.
-    if [ -f "$unit_source" ]; then
-        install -m 0644 "$unit_source" "$unit_target"
-        systemctl daemon-reload
-        if [ -x "$binary_target" ]; then
-            systemctl enable --now vibed >/dev/null 2>&1 || \
-                warn "vibed: systemd enable/start failed — check 'sudo journalctl -u vibed'"
-            ok "vibed: enabled and running"
-        else
-            systemctl enable vibed >/dev/null 2>&1 || true
-            warn "vibed: systemd unit installed but daemon not started (no binary yet)"
-        fi
-    else
-        warn "vibed: systemd unit missing at $unit_source — skipped"
-    fi
-}
-
-# ---------- Install the admin web app ----------
-#
-# The admin app (https://<host>/admin/) is installed automatically by
-# install.sh — operators don't run `vibe install admin` by hand. The
-# steps below mirror what `vibe install <app>` would do for a product
-# app, but skip the user-driven prompts and add the bootstrap-password
-# generation:
-#
-#   1. Generate a random initial admin password + session secret +
-#      Postgres password.
-#   2. Drop the cleartext initial admin password into:
-#        /etc/vibe/admin/admin-bootstrap.password (mode 0600, vibe:vibe)
-#        /var/log/vibe/admin-initial-password.txt (mode 0600, root:root)
-#      The first is read by the admin server on its first boot to seed
-#      the SuperAdmin row; it deletes the file once the row exists.
-#      The second is the operator-readable copy printed in the install
-#      summary; the rotate-password endpoint deletes it once the
-#      operator finishes the force-rotate flow.
-#   3. Render /etc/vibe/admin/.env from the template + /etc/vibe/admin/
-#      postgres_password.
-#   4. Pre-create /var/lib/vibe/admin/ data dirs.
-#   5. Pull + start the admin compose stack with the multi-app overlay.
-#   6. Wait for /health to return 200 (best-effort; if not healthy, the
-#      operator can recover with `sudo vibe doctor`).
-
-# ADMIN_INITIAL_PASSWORD is set by mint_admin_password and read by
-# print_next_steps so the install summary shows the credentials.
-ADMIN_INITIAL_PASSWORD=""
-# Set to 1 by ensure_admin if the stack didn't come up (image denied,
-# pull failed, etc.). print_next_steps reads this so the summary shows
-# the truth instead of pointing the operator at a 404.
-ADMIN_STACK_FAILED=0
-
-mint_admin_password() {
-    # 24-char URL-safe token. openssl rand -base64 outputs 28 chars
-    # for 18 bytes; we trim to 24 so it stays comfortably under the
-    # password column's varchar(255) and the operator can paste it
-    # without line breaks. URL-safe so a future admin app that emits
-    # the password in a copyable URL doesn't have to escape characters.
-    openssl rand -base64 18 | tr -d '\n=' | tr '/+' '_-' | head -c 24
-}
-
-ensure_admin() {
-    local etc="$VIBE_ETC/admin"
-    local data="$VIBE_DATA/admin"
-    install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "$etc"
-    install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "$data"
-    install -d -m 0700 "$data/postgres-data"
-    chown 70:70 "$data/postgres-data" 2>/dev/null || true
-
-    local env_path="$etc/.env"
-    if [ -f "$env_path" ]; then
-        ok "admin env file exists at $env_path — leaving untouched"
-    else
-        log "rendering admin env file..."
-        local pg session admin_pw
-        pg="$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)"
-        session="$(openssl rand -base64 48 | tr -d '\n=' | tr '/+' '_-')"
-        admin_pw="$(mint_admin_password)"
-
-        # Postgres file-secret. Postgres rejects passwords with a
-        # trailing newline so we use printf without one.
-        printf '%s' "$pg" > "$etc/postgres_password"
-        chown "$VIBE_USER:$VIBE_USER" "$etc/postgres_password"
-        chmod 0600 "$etc/postgres_password"
-
-        # Bootstrap password (read by the server on first boot).
-        # 0640 + group `vibe` so the admin container (uid 10001,
-        # supplementary group `vibe` via docker-compose group_add) can
-        # readFile() it on its first boot. /etc/vibe/admin itself is
-        # mode 0750 owned vibe:vibe, so non-vibe non-root host users
-        # still can't list or open the bootstrap file.
-        printf '%s' "$admin_pw" > "$etc/admin-bootstrap.password"
-        chown "$VIBE_USER:$VIBE_USER" "$etc/admin-bootstrap.password"
-        chmod 0640 "$etc/admin-bootstrap.password"
-
-        # Operator-readable cleartext copy. Root-only so a non-root
-        # user on the host can't sudo-less it.
-        install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "$VIBE_LOG"
-        printf '%s\n' "$admin_pw" > "$VIBE_LOG/admin-initial-password.txt"
-        chmod 0600 "$VIBE_LOG/admin-initial-password.txt"
-        chown root:root "$VIBE_LOG/admin-initial-password.txt"
-
-        : "${VIBE_ADMIN_VERSION:=latest}"
-        local vibe_gid; vibe_gid="$(id -g "$VIBE_USER")"
-        # Render env.template. The session secret is for express-session
-        # signing; the postgres password gets inlined into DATABASE_URL;
-        # VIBE_GID is read by docker-compose's group_add so the admin
-        # container can access vibe-group-owned host files/sockets.
-        sed \
-            -e "s|@SESSION_SECRET@|${session}|g" \
-            -e "s|@POSTGRES_PASSWORD@|${pg}|g" \
-            -e "s|@VIBE_ADMIN_VERSION@|${VIBE_ADMIN_VERSION}|g" \
-            -e "s|@VIBE_GID@|${vibe_gid}|g" \
-            "$VIBE_PREFIX/apps/admin/env.template" > "$env_path"
-        chown "$VIBE_USER:$VIBE_USER" "$env_path"
-        chmod 0600 "$env_path"
-
-        ADMIN_INITIAL_PASSWORD="$admin_pw"
-        ok "wrote $env_path (mode 0600)"
-
-        # Refuse to bring the stack up with un-substituted @PLACEHOLDER@
-        # tokens still in the env file. Catches a future template change
-        # that introduces a new placeholder install.sh forgot to replace
-        # (every @FOO@ here would crash the admin container at boot).
-        if grep -qE '@[A-Z][A-Z0-9_]*@' "$env_path"; then
-            grep -nE '@[A-Z][A-Z0-9_]*@' "$env_path" >&2
-            die "admin: $env_path still contains @PLACEHOLDER@ tokens — secret render failed"
-        fi
-    fi
-
-    # ---- Self-heal block (runs on EVERY ensure_admin call) -----------
-    # The early-exit above is "leave the env untouched" — but two things
-    # in this file's history weren't there originally and need to be
-    # backfilled on re-run for an existing appliance. Both are
-    # idempotent: they no-op if the state is already correct.
-    #
-    #   1. VIBE_GID line in /etc/vibe/admin/.env (added 2026-04: lets
-    #      the admin container read its bootstrap password + write to
-    #      /run/vibed.sock via supplementary group).
-    #   2. Bootstrap password file mode 0640 (was 0600 before the same
-    #      change — unreadable inside the container).
-    if ! grep -qE '^VIBE_GID=' "$env_path" 2>/dev/null; then
-        local _backfill_gid; _backfill_gid="$(id -g "$VIBE_USER")"
-        printf '\n# Backfilled by install.sh re-run.\nVIBE_GID=%s\n' "$_backfill_gid" >> "$env_path"
-        log "backfilled VIBE_GID=${_backfill_gid} into $env_path"
-    fi
-    if [ -f "$etc/admin-bootstrap.password" ]; then
-        chmod 0640 "$etc/admin-bootstrap.password" 2>/dev/null || true
-    fi
-
-    # Resolve the host the admin stack should advertise in SITE_URL etc.
-    # On a fresh install render_config sets VIBE_HOST_PICK; on a re-run
-    # render_config short-circuits (config exists) and leaves the global
-    # empty, so we fall back to vibe.conf to avoid baking the default
-    # `vibe.local` into a relaunched admin container on a host whose
-    # real name is something else.
-    local admin_host="$VIBE_HOST_PICK"
-    if [ -z "$admin_host" ] && [ -f "$VIBE_ETC/vibe.conf" ]; then
-        admin_host="$(grep -E '^host=' "$VIBE_ETC/vibe.conf" | cut -d= -f2)"
-    fi
-    [ -z "$admin_host" ] && admin_host="vibe.local"
-
-    # Bring up the stack. We always layer the grouped overlay because
-    # the host is in always-multi-app mode by design — the single-app
-    # ports-published shape exists only as a developer convenience.
-    log "starting admin stack..."
-
-    # Capture pull stderr so we can distinguish three failure modes:
-    #   - "denied"   → upstream image not published or package is private.
-    #                  Not recoverable from the installer; the operator
-    #                  needs to publish/build the image.
-    #   - "no such host" / "timeout" / etc. → genuine offline/transient.
-    #   - anything else → unknown; keep raw output so it isn't lost.
-    local pull_out pull_rc=0
-    pull_out="$(VIBE_HOST="$admin_host" docker compose \
-        --project-name vibe-admin \
-        --env-file "$env_path" \
-        -f "$VIBE_PREFIX/apps/admin/docker-compose.yml" \
-        -f "$VIBE_PREFIX/apps/admin/docker-compose.grouped.yml" \
-        pull --quiet 2>&1)" || pull_rc=$?
-
-    local pull_denied=0
-    if [ "$pull_rc" -ne 0 ]; then
-        printf '%s\n' "$pull_out" >&2
-        if printf '%s' "$pull_out" | grep -qiE 'denied|unauthorized|not found|manifest unknown'; then
-            pull_denied=1
-            warn "admin: image pull was DENIED by GHCR — the upstream image is not"
-            warn "       published yet (or the package is private). The admin web UI"
-            warn "       will not be reachable until that's fixed. CLI works fine."
-            warn "       Verify with: docker pull ghcr.io/kisaesdevlab/vibe-admin:latest"
-        else
-            warn "admin: image pull failed (see error above) — will try a cached image if any"
-        fi
-    fi
-
-    if ! VIBE_HOST="$admin_host" docker compose \
-        --project-name vibe-admin \
-        --env-file "$env_path" \
-        -f "$VIBE_PREFIX/apps/admin/docker-compose.yml" \
-        -f "$VIBE_PREFIX/apps/admin/docker-compose.grouped.yml" \
-        up -d --remove-orphans; then
-        if [ "$pull_denied" -eq 1 ]; then
-            warn "admin: stack failed to start because the image isn't available."
-            warn "       This is the same root cause as the pull failure above —"
-            warn "       not a docker logs issue. Skipping logs hint."
-        else
-            warn "admin: failed to start — run 'sudo vibe doctor' and check 'docker logs vibe-admin-admin-1'"
-        fi
-        # Mark the failure so print_next_steps + the install summary tell
-        # the operator the truth instead of pointing them at a 404.
-        ADMIN_STACK_FAILED=1
+    if [ ! -f "$svc_source" ] || [ ! -f "$timer_source" ]; then
+        warn "${svc}: unit files missing in $VIBE_PREFIX/etc/systemd/system/ — skipped"
         return 0
     fi
 
-    # Reload the ingress so the admin caddy.fragment is included in
-    # the Caddyfile. ingress_render_caddyfile pulls in apps/admin/
-    # caddy.fragment automatically (see lib/ingress.sh).
-    "$VIBE_PREFIX/bin/vibe" mode multi >/dev/null 2>&1 || true
-    ok "admin: stack up (https://${admin_host}/admin/)"
+    install -m 0644 "$svc_source"   "$svc_target"
+    install -m 0644 "$timer_source" "$timer_target"
+    systemctl daemon-reload
+
+    if systemctl enable --now "${svc}.timer" >/dev/null 2>&1; then
+        ok "${svc}.timer: enabled (daily refresh of landing-page update data)"
+    else
+        warn "${svc}.timer: enable/start failed — check 'journalctl -u ${svc}.timer'"
+    fi
 }
+
+# ---------- Migrate away from the old admin SPA + vibed daemon ----------
+# Pre-2026-04 installs ran the Vibe-Admin SPA + a Go vibed daemon. Both
+# are gone. This step idempotently tears them down on re-install:
+#
+#   - Stops + removes the vibe-admin compose project (drops the postgres
+#     volume too — no archive, per the design choice).
+#   - Removes /etc/vibe/admin/ + /var/lib/vibe/admin/ entirely.
+#   - Disables + removes the vibed.service systemd unit.
+#   - Removes the vibed binary + socket.
+#
+# No-op on a fresh install. Runs early in main() so the rest of the
+# bootstrap sees a clean slate.
+migrate_drop_admin() {
+    local cleaned_anything=0
+
+    # 1. Tear down the admin compose project if anything from it is around.
+    if has_cmd docker; then
+        if docker ps -a --filter 'name=^vibe-admin-' --format '{{.Names}}' 2>/dev/null \
+                | grep -q .; then
+            log "migrate: stopping the previous admin stack (data + postgres volume will be removed)..."
+            # Use the project name + the original compose files when they're
+            # still present. If the compose files are already gone (post-
+            # delete), `docker compose --project-name vibe-admin down`
+            # without `-f` still works because docker compose looks up the
+            # project's containers by label.
+            docker compose --project-name vibe-admin down --remove-orphans --volumes \
+                >/dev/null 2>&1 || true
+            cleaned_anything=1
+        fi
+    fi
+
+    # 2. Drop config + data dirs.
+    if [ -d "$VIBE_ETC/admin" ] || [ -d "$VIBE_DATA/admin" ]; then
+        rm -rf "$VIBE_ETC/admin" "$VIBE_DATA/admin"
+        cleaned_anything=1
+    fi
+
+    # 3. Disable + remove the vibed systemd unit + binary + socket.
+    if [ -f /etc/systemd/system/vibed.service ] || [ -x /usr/local/bin/vibed ]; then
+        systemctl disable --now vibed >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/vibed.service /usr/local/bin/vibed /run/vibed.sock
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        cleaned_anything=1
+    fi
+
+    if [ "$cleaned_anything" -eq 1 ]; then
+        ok "migrate: removed previous admin stack — control panel is now at https://<host>/"
+    fi
+}
+
+# NOTE: `ensure_vibed` and `ensure_admin` lived here pre-2026-04. Both
+# are gone — the admin SPA + vibed daemon were replaced by the static
+# operator panel on the landing page. Migration of existing installs
+# is handled by `migrate_drop_admin` above. The systemd timer that
+# refreshes the landing page's update-available data is installed by
+# `ensure_upgrade_check_timer` above.
+
 
 # ---------- Post-install sanity check ----------
 # Cheap end-of-bootstrap audit. Prevents a silently-half-baked state
@@ -890,30 +681,15 @@ verify_install() {
         err "ingress container vibe-ingress-caddy is not running"; errs=$((errs+1))
     fi
 
-    # --- Admin (graceful when the image isn't published) -------------
-    # Admin is the web management UI — convenient but not required.
-    # When ensure_admin set ADMIN_STACK_FAILED=1 (e.g. GHCR pull denied
-    # because upstream hasn't published the image yet), don't trip the
-    # fatal counter — print_next_steps already tells the operator the
-    # admin URL won't work, and the CLI is fully usable without it.
-    [ -f "$VIBE_ETC/admin/.env" ] || { err "missing $VIBE_ETC/admin/.env"; errs=$((errs+1)); }
-    if [ "${ADMIN_STACK_FAILED:-0}" = "1" ]; then
-        warn "admin: web UI not running — install completes, CLI still works"
-        warn "       (resolve the GHCR access issue then re-run install.sh)"
-    else
-        # Admin container can take a few seconds for postgres init + node boot
-        # after `up -d` returns. Poll briefly before giving up.
-        local deadline=$(( $(date +%s) + 30 )) admin_up=0
-        while [ "$(date +%s)" -lt "$deadline" ]; do
-            if docker ps --filter 'name=^vibe-admin-admin-1$' --format '{{.Names}}' \
-               | grep -qx vibe-admin-admin-1; then
-                admin_up=1
-                break
-            fi
-            sleep 2
-        done
-        [ "$admin_up" -eq 1 ] || { err "admin container vibe-admin-admin-1 is not running"; errs=$((errs+1)); }
-    fi
+    # --- Landing page data feeds -------------------------------------
+    # The operator panel needs all three to render. ingress_render_caddyfile
+    # writes installed.json + appliance.json on every render; the upgrade
+    # check JSON is written by ensure_upgrade_check_timer's first run (or
+    # populated lazily by the daily timer).
+    [ -f "$VIBE_PREFIX/ingress/landing/__vibe_installed.json" ] \
+        || { err "missing __vibe_installed.json (ingress render didn't run?)"; errs=$((errs+1)); }
+    [ -f "$VIBE_PREFIX/ingress/landing/__vibe_appliance.json" ] \
+        || { err "missing __vibe_appliance.json (ingress render didn't run?)"; errs=$((errs+1)); }
 
     if [ "$errs" -gt 0 ]; then
         err "install did not reach a healthy state ($errs check(s) failed)"
@@ -990,42 +766,13 @@ EOM
 EOM
     fi
 
-    if [ "${ADMIN_STACK_FAILED:-0}" = "1" ]; then
-        cat <<EOM
-  ${_YEL}The admin web app is NOT reachable yet.${_R}
-
-  The admin image (ghcr.io/kisaesdevlab/vibe-admin) couldn't be pulled —
-  see the [warn] lines above for the exact registry error. Until the
-  image is published (or made accessible to this host), use the CLI:
-
-EOM
-    else
-        cat <<EOM
-  Manage this appliance from your browser:
-
-    URL:       ${host_scheme}://${host}/admin/
-    Username:  admin
-EOM
-        if [ -n "$ADMIN_INITIAL_PASSWORD" ]; then
-            cat <<EOM
-    Password:  ${ADMIN_INITIAL_PASSWORD}
-
-  ${_YEL}This password was generated by install.sh and is also saved at
-  ${VIBE_LOG}/admin-initial-password.txt (mode 0600, root-only).
-  You'll be asked to change it on first sign-in; the file is deleted
-  automatically once you do.${_R}
-
-EOM
-        else
-            cat <<EOM
-    Password:  see ${VIBE_LOG}/admin-initial-password.txt on this host
-               (or run 'sudo cat ${VIBE_LOG}/admin-initial-password.txt')
-
-EOM
-        fi
-    fi
     cat <<EOM
-  Or install + manage apps from the command line:
+  The landing page at ${host_scheme}://${host}/ is the operator panel —
+  it lists installed apps, shows which have updates available, and
+  surfaces copy-pasteable SSH commands for installing/upgrading apps
+  from this host.
+
+  Install + manage apps from the command line:
     sudo vibe install mybooks         Vibe MyBooks (bookkeeping)
     sudo vibe install connect         Vibe Connect (encrypted messaging)
     sudo vibe install tb              Vibe TB (trial balance)
@@ -1067,10 +814,14 @@ main() {
     ensure_repo
     ensure_symlink
     ensure_network
+    # Tear down any previous admin SPA + vibed daemon (idempotent — no-op
+    # on a fresh install). Runs AFTER ensure_repo so $VIBE_PREFIX exists,
+    # but BEFORE render_config so the rest of the bootstrap sees a clean
+    # slate.
+    migrate_drop_admin
     render_config
     ensure_ingress
-    ensure_vibed
-    ensure_admin
+    ensure_upgrade_check_timer
     verify_install
     print_next_steps
 }

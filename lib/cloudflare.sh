@@ -147,30 +147,8 @@ cloudflare_logs() {
     docker logs -f --tail=100 vibe-ingress-cloudflared
 }
 
-# ---------- Deprecation shims ----------
-#
-# The pre-2026-04 model had `vibe cloudflare attach <app>` / `detach <app>`
-# spinning up one cloudflared per app. That's gone — the ingress owns the
-# tunnel now. Keep the verbs as friendly redirects so muscle memory still
-# works.
-
-cloudflare_attach() {
-    local app="${1:-}"
-    if [ -n "$app" ]; then
-        warn "'vibe cloudflare attach <app>' is deprecated — the ingress now"
-        warn "owns a single tunnel for every app. To set the token, use:"
-        warn "  sudo vibe cloudflare set-token [<token>]"
-    fi
-    # Forward any --token argument to set-token so old callers keep working.
-    shift || true
-    cloudflare_set_token "$@"
-}
-
-cloudflare_detach() {
-    warn "'vibe cloudflare detach <app>' is deprecated — the tunnel is per-ingress"
-    warn "now, not per-app. To stop tunneling entirely, clear the token and"
-    warn "switch tls_mode away from cf-tunnel:"
-    warn "  sudo vibe cloudflare clear"
-    warn "  sudo vibe ingress mode internal     (re-run install.sh to switch modes)"
-    return 1
-}
+# Note: `vibe cloudflare attach/detach <app>` (the pre-2026-04 per-app
+# model) was deprecated when the ingress took over the tunnel. The
+# deprecation shims sat here for one release alongside the admin SPA
+# that called them. The admin SPA + vibed daemon are gone now too, so
+# the shims have no callers — removed.

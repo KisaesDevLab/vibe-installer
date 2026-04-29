@@ -1,0 +1,18 @@
+# Drives vibe-upgrade-check.service on a daily cadence.
+#
+# OnBootSec=5min so a freshly-rebooted appliance gets a check shortly
+# after boot (catches operators who power-cycle weekly). OnUnitActiveSec
+# handles the recurring 24h cadence. Persistent=true so a missed
+# scheduled run (machine off at 03:00) catches up on the next boot.
+
+[Unit]
+Description=Daily refresh of landing-page update-available data
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+Persistent=true
+Unit=vibe-upgrade-check.service
+
+[Install]
+WantedBy=timers.target

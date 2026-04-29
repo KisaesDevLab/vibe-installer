@@ -21,6 +21,13 @@ host=vibe.local
 # tls_mode is acme/cf-tunnel where the SAN doesn't apply.
 host_ip=
 
+# SSH user shown by the landing page's operator panel in the
+# `ssh <user>@<host>` snippet. Auto-detected from $SUDO_USER (or
+# logname) at install time. Hand-edit if you'll log in as a different
+# user. The landing page is purely informational — changing this here
+# doesn't affect actual SSH access.
+ssh_user=
+
 # TLS strategy:
 #   internal   — Caddy 'tls internal' + caddy trust on the host (LAN/mDNS)
 #   acme       — Caddy ACME HTTP-01 on :80 (public FQDN, A record required)

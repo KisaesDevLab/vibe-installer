@@ -17,7 +17,6 @@ update_check_image() {
         tb)      printf 'kisaesdevlab/vibe-tb-api\n' ;;
         payroll) printf 'kisaesdevlab/vibe-payroll-api\n' ;;
         tax)     printf 'kisaesdevlab/vibe-tax-api\n' ;;
-        admin)   printf 'kisaesdevlab/vibe-admin\n' ;;
     esac
 }
 
@@ -136,17 +135,6 @@ update_check_run_json() {
         first=0
         _update_check_emit_app_json "$app"
     done
-
-    # Always emit an admin entry. The system admin app isn't in the
-    # `installed=` list (it's bootstrap-installed by install.sh) but
-    # still shows up in the operator's Updates view because admin
-    # self-upgrade is a real ergonomic flow. Skip if /etc/vibe/admin/.env
-    # is missing (e.g. the operator never finished bootstrap).
-    if [ -f "${VIBE_ETC}/admin/.env" ]; then
-        if [ "$first" -eq 0 ]; then printf ','; fi
-        first=0
-        _update_check_emit_app_json admin
-    fi
 
     printf ']}\n'
 }

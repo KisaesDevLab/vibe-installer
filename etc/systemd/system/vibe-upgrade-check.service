@@ -1,0 +1,26 @@
+# vibe-upgrade-check — refresh the landing page's "update available" data.
+#
+# One-shot. Runs `vibe ingress refresh-updates` which calls
+# `vibe upgrade-check --json`, walks each installed app's GHCR image,
+# and writes the result to /opt/vibe-installer/ingress/landing/__vibe_upgrade_check.json.
+# Failures (offline, GHCR unreachable) preserve the previous good
+# snapshot — see lib/ingress.sh::ingress_refresh_upgrade_check.
+#
+# Triggered by vibe-upgrade-check.timer (daily). Operators can also run
+# it on demand: sudo vibe ingress refresh-updates.
+
+[Unit]
+Description=Refresh landing-page update-available data
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vibe ingress refresh-updates
+# Run as root: `vibe upgrade-check` reads /etc/vibe/vibe.conf (mode
+# 0640 vibe:vibe — root reads regardless) and writes into the landing
+# dir owned by root.
+User=root
+# Don't fail the unit if the network is briefly down — the wrapper
+# preserves prior data on failure.
+SuccessExitStatus=0 1

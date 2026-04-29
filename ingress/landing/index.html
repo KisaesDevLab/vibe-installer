@@ -14,37 +14,87 @@
         </header>
 
         <section class="tiles">
-            <!-- Tiles are rendered by lib/ingress.sh on Caddyfile (re-)render.
-                 Each installed app gets one card; the rest are hidden. -->
+            <!-- Tiles for installed apps. JS hides the rest at load using
+                 /__vibe_installed.json. Update badges are rendered into
+                 .tile__badge from /__vibe_upgrade_check.json. -->
             <a class="tile tile--mybooks" href="/mybooks/" data-app="mybooks">
+                <span class="tile__badge" hidden></span>
                 <div class="tile__icon">📚</div>
                 <h2>Vibe MyBooks</h2>
                 <p>Bookkeeping &amp; client books.</p>
             </a>
 
             <a class="tile tile--connect" href="/connect/" data-app="connect">
+                <span class="tile__badge" hidden></span>
                 <div class="tile__icon">💬</div>
                 <h2>Vibe Connect</h2>
                 <p>Encrypted staff &amp; client messaging.</p>
             </a>
 
             <a class="tile tile--tb" href="/tb/" data-app="tb">
+                <span class="tile__badge" hidden></span>
                 <div class="tile__icon">📊</div>
                 <h2>Vibe TB</h2>
                 <p>Trial-balance workpapers.</p>
             </a>
 
             <a class="tile tile--payroll" href="/payroll/" data-app="payroll">
+                <span class="tile__badge" hidden></span>
                 <div class="tile__icon">⏱️</div>
                 <h2>Vibe Payroll Time</h2>
                 <p>Time tracking &amp; payroll prep.</p>
             </a>
 
             <a class="tile tile--tax" href="/tax/" data-app="tax">
+                <span class="tile__badge" hidden></span>
                 <div class="tile__icon">🧾</div>
                 <h2>Vibe Tax Research</h2>
                 <p>AI tax-research chat (CPA-grade citations).</p>
             </a>
+        </section>
+
+        <!-- ============== Operator panel ============== -->
+        <!-- Static replacement for the previous /admin/ SPA. Everything
+             here is informational — no buttons that mutate state.
+             Operators run the shown commands over SSH. -->
+        <section class="ops" aria-labelledby="ops-title">
+            <div class="ops__header">
+                <div>
+                    <h2 id="ops-title">Operator panel</h2>
+                    <p class="ops__ssh">
+                        SSH:
+                        <code id="ops-ssh-cmd">ssh vibe@vibe.local</code>
+                        <button class="copy-btn" data-copy-target="ops-ssh-cmd" type="button" aria-label="Copy SSH command">Copy</button>
+                    </p>
+                </div>
+                <div class="ops__updates">
+                    <span id="ops-checked-at">Updates not checked yet</span>
+                    <span id="ops-checked-warn" class="ops__warn" hidden></span>
+                </div>
+            </div>
+
+            <div class="ops__toolbar">
+                <button id="ops-expand-all" type="button">Expand all</button>
+                <button id="ops-collapse-all" type="button">Collapse all</button>
+            </div>
+
+            <!-- Per-app collapsible cards. JS clones .ops-card-template for
+                 each supported app, populating header + commands from the
+                 three JSONs. Defaults collapsed. -->
+            <div id="ops-cards"></div>
+
+            <!-- Diagnostics card — always expanded. -->
+            <details class="ops-card ops-card--diag" open>
+                <summary>
+                    <span class="ops-card__icon">🩺</span>
+                    <span class="ops-card__name">Diagnostics</span>
+                </summary>
+                <div class="ops-card__body">
+                    <div class="cmd"><code>sudo vibe doctor</code><button class="copy-btn" type="button">Copy</button></div>
+                    <div class="cmd"><code>sudo vibe status</code><button class="copy-btn" type="button">Copy</button></div>
+                    <div class="cmd"><code>sudo vibe report --for-download</code><button class="copy-btn" type="button">Copy</button></div>
+                </div>
+            </details>
         </section>
 
         <footer>
@@ -60,45 +110,229 @@
                     <code>install.sh</code> instead.
                 </span>
             </p>
-            <p class="hint">
-                Need help? Run <code>vibe doctor</code> on the host or visit the
-                <a href="https://github.com/KisaesDevLab/vibe-installer">installer docs</a>.
-            </p>
         </footer>
     </main>
 
-    <!-- Two small enhancements:
-         1. Hide tiles for apps that aren't installed. The installer writes
-            /__vibe_installed.json (one line per app) at render time.
-         2. Surface the current page's URL in the footer so the operator
-            knows what to share with their team — and warn that the .local
-            URL may not resolve on every device on the network. -->
+    <!-- App registry — single source of truth for the operator panel. The
+         tiles above are still hand-written for SEO/no-JS rendering, but
+         the per-app cards below are templated from this list so adding a
+         new app means appending one entry instead of duplicating markup. -->
+    <script>
+        window.VIBE_APPS = [
+            { id: 'mybooks', name: 'Vibe MyBooks',        icon: '📚' },
+            { id: 'connect', name: 'Vibe Connect',        icon: '💬' },
+            { id: 'tb',      name: 'Vibe TB',             icon: '📊' },
+            { id: 'payroll', name: 'Vibe Payroll Time',   icon: '⏱️' },
+            { id: 'tax',     name: 'Vibe Tax Research',   icon: '🧾' }
+        ];
+    </script>
     <script>
         (function () {
-            // 1. Tile visibility from /__vibe_installed.json.
-            fetch('/__vibe_installed.json', { cache: 'no-store' })
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .then(function (installed) {
-                    if (!installed) return;
-                    var apps = installed.apps || [];
-                    document.querySelectorAll('.tile').forEach(function (el) {
-                        if (apps.indexOf(el.dataset.app) === -1) {
-                            el.style.display = 'none';
-                        }
-                    });
-                })
-                .catch(function () { /* leave all tiles visible on fetch error */ });
-
-            // 2. Fill in the share-URL line in the footer. window.location.origin
-            // is the URL the user typed to get here, which is exactly the URL
-            // they should share. Surface a soft warning if that URL is a .local
-            // hostname (mDNS), since not every Windows machine resolves those.
-            var urlEl = document.getElementById('vibe-current-url');
-            var warnEl = document.getElementById('vibe-mdns-warning');
-            if (urlEl) urlEl.textContent = window.location.origin + '/';
-            if (warnEl && /\.local$/i.test(window.location.hostname)) {
-                warnEl.hidden = false;
+            // ------------- shared helpers -------------
+            function fetchJSON(path) {
+                return fetch(path, { cache: 'no-store' })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .catch(function () { return null; });
             }
+            function el(tag, attrs, children) {
+                var node = document.createElement(tag);
+                if (attrs) Object.keys(attrs).forEach(function (k) {
+                    if (k === 'class') node.className = attrs[k];
+                    else if (k === 'text') node.textContent = attrs[k];
+                    else node.setAttribute(k, attrs[k]);
+                });
+                (children || []).forEach(function (c) { node.appendChild(c); });
+                return node;
+            }
+            function copyToClipboard(text) {
+                if (navigator.clipboard) return navigator.clipboard.writeText(text);
+                // Fallback for non-secure contexts (http://)
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+                return Promise.resolve();
+            }
+            function relativeTime(unixSec) {
+                if (!unixSec) return null;
+                var diff = Math.floor(Date.now() / 1000) - unixSec;
+                if (diff < 60) return 'just now';
+                if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+                if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+                return Math.floor(diff / 86400) + 'd ago';
+            }
+
+            // ------------- footer share-URL hint -------------
+            var urlEl = document.getElementById('vibe-current-url');
+            var mdnsWarnEl = document.getElementById('vibe-mdns-warning');
+            if (urlEl) urlEl.textContent = window.location.origin + '/';
+            if (mdnsWarnEl && /\.local$/i.test(window.location.hostname)) {
+                mdnsWarnEl.hidden = false;
+            }
+
+            // ------------- copy buttons -------------
+            // Single delegated handler. Either copy from the element named
+            // by data-copy-target, or copy the previous-sibling <code>'s text.
+            document.body.addEventListener('click', function (ev) {
+                var t = ev.target;
+                if (!t.classList || !t.classList.contains('copy-btn')) return;
+                var src;
+                if (t.dataset.copyTarget) {
+                    var srcEl = document.getElementById(t.dataset.copyTarget);
+                    src = srcEl ? srcEl.textContent : '';
+                } else {
+                    var prev = t.previousElementSibling;
+                    src = prev ? prev.textContent : '';
+                }
+                if (!src) return;
+                copyToClipboard(src.trim()).then(function () {
+                    var orig = t.textContent;
+                    t.textContent = 'Copied';
+                    setTimeout(function () { t.textContent = orig; }, 1200);
+                });
+            });
+
+            // ------------- expand / collapse all -------------
+            document.getElementById('ops-expand-all').addEventListener('click', function () {
+                document.querySelectorAll('#ops-cards details').forEach(function (d) { d.open = true; });
+            });
+            document.getElementById('ops-collapse-all').addEventListener('click', function () {
+                document.querySelectorAll('#ops-cards details').forEach(function (d) { d.open = false; });
+            });
+
+            // ------------- main render -------------
+            // Fetch all three feeds in parallel; render once they all resolve
+            // (or null on 404 — first render before any install.sh run).
+            Promise.all([
+                fetchJSON('/__vibe_installed.json'),
+                fetchJSON('/__vibe_upgrade_check.json'),
+                fetchJSON('/__vibe_appliance.json')
+            ]).then(function (results) {
+                render(results[0], results[1], results[2]);
+            });
+
+            function render(installed, updates, appliance) {
+                var installedSet = new Set((installed && installed.apps) || []);
+
+                // Index upgrade-check entries by app id for quick lookup.
+                var updateByApp = {};
+                if (updates && Array.isArray(updates.apps)) {
+                    updates.apps.forEach(function (u) { updateByApp[u.app] = u; });
+                }
+
+                // 1. Tile visibility + update badges
+                document.querySelectorAll('.tile').forEach(function (tileEl) {
+                    var id = tileEl.dataset.app;
+                    if (!installedSet.has(id)) {
+                        tileEl.style.display = 'none';
+                        return;
+                    }
+                    var u = updateByApp[id];
+                    var badge = tileEl.querySelector('.tile__badge');
+                    if (badge && u && u.status === 'outdated' && u.latest) {
+                        badge.textContent = '↑ ' + u.latest;
+                        badge.hidden = false;
+                    }
+                });
+
+                // 2. SSH header from appliance JSON
+                if (appliance && appliance.host) {
+                    var user = appliance.ssh_user || 'vibe';
+                    var host = appliance.host;
+                    document.getElementById('ops-ssh-cmd').textContent = 'ssh ' + user + '@' + host;
+                }
+
+                // 3. Last-checked indicator + failure note
+                var checkedAtEl = document.getElementById('ops-checked-at');
+                var warnEl = document.getElementById('ops-checked-warn');
+                if (updates && updates.checked_at) {
+                    checkedAtEl.textContent = 'Updates last checked ' + relativeTime(updates.checked_at);
+                    // If the most recent check failed (no successful entry),
+                    // last_success_at lags behind checked_at — show the gap.
+                    if (updates.last_success_at && updates.last_success_at < updates.checked_at - 60) {
+                        warnEl.textContent = '(check failed; last good data ' +
+                            relativeTime(updates.last_success_at) + ')';
+                        warnEl.hidden = false;
+                    } else if (!updates.last_success_at) {
+                        warnEl.textContent = '(no successful check yet)';
+                        warnEl.hidden = false;
+                    }
+                } else {
+                    checkedAtEl.textContent = 'Updates not checked yet';
+                }
+
+                // 4. Per-app collapsible cards
+                var cardsHost = document.getElementById('ops-cards');
+                window.VIBE_APPS.forEach(function (app) {
+                    var isInstalled = installedSet.has(app.id);
+                    var u = updateByApp[app.id];
+                    var pillText, pillClass;
+                    if (!isInstalled) {
+                        pillText = 'Not installed';
+                        pillClass = 'pill pill--off';
+                    } else if (u && u.status === 'outdated') {
+                        pillText = 'Update available · ' + u.latest;
+                        pillClass = 'pill pill--upd';
+                    } else if (u && u.current) {
+                        pillText = 'Installed v' + u.current;
+                        pillClass = 'pill pill--on';
+                    } else {
+                        pillText = 'Installed';
+                        pillClass = 'pill pill--on';
+                    }
+
+                    // Build commands list per state
+                    var cmds;
+                    if (isInstalled) {
+                        cmds = [];
+                        if (u && u.status === 'outdated' && u.recommended_command) {
+                            cmds.push({ text: 'sudo ' + u.recommended_command, highlight: true });
+                        } else {
+                            cmds.push({ text: 'sudo vibe upgrade ' + app.id, highlight: false });
+                        }
+                        cmds.push({ text: 'sudo vibe logs '      + app.id });
+                        cmds.push({ text: 'sudo vibe backup '    + app.id });
+                        cmds.push({ text: 'sudo vibe uninstall ' + app.id });
+                    } else {
+                        cmds = [{ text: 'sudo vibe install ' + app.id }];
+                    }
+
+                    var details = el('details', { class: 'ops-card' });
+                    var summary = el('summary', null, [
+                        el('span', { class: 'ops-card__icon', text: app.icon }),
+                        el('span', { class: 'ops-card__name', text: app.name }),
+                        el('span', { class: pillClass, text: pillText })
+                    ]);
+                    details.appendChild(summary);
+
+                    var body = el('div', { class: 'ops-card__body' });
+                    cmds.forEach(function (c) {
+                        var row = el('div', { class: c.highlight ? 'cmd cmd--hl' : 'cmd' });
+                        row.appendChild(el('code', { text: c.text }));
+                        var btn = el('button', { class: 'copy-btn', type: 'button' });
+                        btn.textContent = 'Copy';
+                        row.appendChild(btn);
+                        body.appendChild(row);
+                    });
+                    details.appendChild(body);
+                    cardsHost.appendChild(details);
+                });
+            }
+
+            // Re-fetch every 60s so a long-open tab picks up new installs/
+            // updates without a manual refresh. Safe because all renders
+            // are full-replacement: clear cards host, rebuild.
+            setInterval(function () {
+                document.getElementById('ops-cards').innerHTML = '';
+                Promise.all([
+                    fetchJSON('/__vibe_installed.json'),
+                    fetchJSON('/__vibe_upgrade_check.json'),
+                    fetchJSON('/__vibe_appliance.json')
+                ]).then(function (r) { render(r[0], r[1], r[2]); });
+            }, 60000);
         })();
     </script>
 </body>

@@ -54,6 +54,24 @@ vibe mode | grep -q multi || fail "expected mode=multi after bootstrap"
 # trip this whether or not cf-tunnel is in use.
 vibe ingress preview >/dev/null || fail "vibe ingress preview failed (rendered Caddyfile is invalid)"
 
+# Landing-page data feeds. The operator panel needs all three to render.
+# installed.json + appliance.json are written by ingress_render_caddyfile;
+# upgrade_check.json is written by the systemd timer's first run (or
+# lazily on the first refresh-updates call). Allow it to be missing on a
+# fresh install — the landing page handles 404 gracefully.
+curl -fsSk "https://${VIBE_HOST}/__vibe_installed.json" >/dev/null \
+    || fail "/__vibe_installed.json unreachable"
+curl -fsSk "https://${VIBE_HOST}/__vibe_appliance.json" >/dev/null \
+    || fail "/__vibe_appliance.json unreachable"
+
+# Admin route is gone (replaced by the operator panel on / itself).
+admin_status="$(curl -k -o /dev/null -s -w '%{http_code}' "https://${VIBE_HOST}/admin/" || true)"
+[ "$admin_status" = "404" ] || fail "/admin/ should return 404 (got $admin_status) — admin SPA was supposed to be removed"
+
+# Daily upgrade-check timer is enabled.
+systemctl is-enabled vibe-upgrade-check.timer >/dev/null \
+    || fail "vibe-upgrade-check.timer not enabled"
+
 # ---------- 1. First app: lands behind the ingress immediately ----------
 first_app="${VIBE_SMOKE_APPS%% *}"
 step "install $first_app (multi-app, via ingress)"
