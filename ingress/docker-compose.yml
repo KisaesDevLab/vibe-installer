@@ -34,13 +34,15 @@ services:
     networks:
       - vibe_ingress
     healthcheck:
-      # Caddy auto-redirects HTTP → HTTPS for any configured site, so
-      # probing port 80 always returns 308 and wget exits non-zero.
-      # Probe HTTPS directly with --no-check-certificate (the local
-      # `tls internal` cert isn't in the container's trust store) and
-      # a Host: header that matches the configured site so we hit the
-      # /healthz route Caddyfile.template defines.
-      test: ['CMD-SHELL', 'wget --no-check-certificate -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- https://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok"']
+      # Caddy serves over HTTPS in `internal` and `acme` modes (auto-https
+      # redirects HTTP → HTTPS so probing :80 always returns 308) and
+      # over plain HTTP in `cf-tunnel` mode (Cloudflare terminates TLS
+      # upstream). Try HTTPS first with --no-check-certificate (the
+      # `tls internal` cert isn't in the container's trust store), and
+      # fall back to HTTP for cf-tunnel. The Host: header matches the
+      # configured site so we hit the /healthz route Caddyfile.template
+      # defines.
+      test: ['CMD-SHELL', 'wget --no-check-certificate -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- https://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok" || wget -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- http://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok"']
       interval: 30s
       timeout: 5s
       retries: 3

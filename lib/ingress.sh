@@ -84,9 +84,18 @@ ingress_render_caddyfile() {
     #    cf-tunnel target hostname is the only thing the tunnel routes
     #    to anyway. The placeholder is replaced via awk; Caddy's own
     #    {$VIBE_HOST} substitution still works for the hostname leg.
+    #
+    #    cf-tunnel mode prefixes `http://` so Caddy serves the site on
+    #    plain :80 only — `auto_https` is a *global* directive in
+    #    Caddy and would crash the config if placed inside a site
+    #    block. The `http://` scheme is the per-site way to opt out
+    #    of HTTPS, and is the right shape for cloudflared which
+    #    terminates TLS at the edge.
     local site_hosts="{\$VIBE_HOST}"
     if [ "$tls" = "internal" ] && [ -n "$host_ip" ]; then
         site_hosts="{\$VIBE_HOST}, ${host_ip}"
+    elif [ "$tls" = "cf-tunnel" ]; then
+        site_hosts="http://{\$VIBE_HOST}"
     fi
 
     # 1. Build the @@TLS_DIRECTIVE@@ + @@EMAIL_LINE@@ blocks.
@@ -117,8 +126,11 @@ ingress_render_caddyfile() {
             ;;
         cf-tunnel)
             # No TLS at the Caddy layer; cloudflared terminates upstream.
-            tls_directive=$'    auto_https off'
-            email_line=$'    # tls=cf-tunnel — Cloudflare terminates TLS'
+            # The `http://` scheme on SITE_HOSTS (set above) tells Caddy
+            # to serve plain HTTP and skip auto-HTTPS for this site, so
+            # nothing needs to go inside the site block here.
+            tls_directive=$'    # tls=cf-tunnel — plain HTTP, Cloudflare terminates TLS at the edge'
+            email_line=$'    # tls=cf-tunnel — no ACME registration'
             ;;
         *) die "unknown tls_mode: $tls (expected internal|acme|cf-tunnel)" ;;
     esac
