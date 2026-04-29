@@ -36,3 +36,13 @@ installed=
 
 # Last time the license public key bundle was refreshed (unix epoch).
 license_pubkey_fetched_at=0
+
+# Whether `vibe install <app>` runs the licensing flow (pubkey fetch +
+# token prompt + trial fallback against licensing.kisaes.com).
+#   0 = skip the flow entirely. The app's env file gets
+#       DISABLE_LICENSE_CHECK=1 so the app doesn't enforce. Use this
+#       while the licensing server isn't deployed yet.
+#   1 = require activation. Prompt for a token, request a 30-day trial
+#       if blank, refuse to install if both fail.
+# `vibe license set <app> <token>` works in either mode.
+license_required=0

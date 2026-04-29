@@ -122,6 +122,22 @@ license_activate() {
         return 0
     fi
 
+    # Opt-out: if licensing infra isn't deployed yet, skip the whole
+    # flow (no pubkey fetch, no prompt, no trial call). vibe.conf's
+    # `license_required` defaults to 0 until the licensing server is
+    # live; VIBE_LICENSE_REQUIRE=1 in the env force-enables for one
+    # invocation. The app's env file still gets DISABLE_LICENSE_CHECK=1
+    # so the app itself doesn't enforce.
+    local required="${VIBE_LICENSE_REQUIRE:-}"
+    if [ -z "$required" ]; then
+        required="$(config_get license_required 2>/dev/null)"
+    fi
+    if [ -z "$required" ] || [ "$required" = "0" ]; then
+        secrets_set "$app" DISABLE_LICENSE_CHECK 1
+        ok "license: ${app} skipped (license_required=0 in vibe.conf)"
+        return 0
+    fi
+
     license_fetch_pubkey "$app" || warn "license: continuing without verified pubkey"
 
     # 1. Env var (unattended).
