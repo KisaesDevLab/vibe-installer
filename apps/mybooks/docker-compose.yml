@@ -236,9 +236,16 @@ services:
       - /var/lib/vibe/mybooks/glm-ocr-models:/models
     logging: *default-logging
 
-  # Cloudflare Tunnel sidecar — gated behind --profile tunnel. Same
-  # customer-owned-token model as the dev compose; never bundles
-  # Kisaes credentials. Opt in via `docker compose --profile tunnel up`.
+  # Cloudflare Tunnel sidecar — gated behind --profile tunnel.
+  #
+  # NOTE (2026-04 single-ingress refactor): the vibe-installer no longer
+  # activates this sidecar. The ingress (ingress/docker-compose.yml) owns
+  # a single cloudflared service for every installed app; lib/apps.sh
+  # never passes `--profile tunnel` to apps_compose anymore, so this
+  # block stays dormant. It's kept here only because this file is vendored
+  # from KisaesDevLab/vibe-mybooks:docker-compose.prod.yml — deleting it
+  # would diverge from upstream. Operators wanting a tunnel should run
+  # `sudo vibe cloudflare set-token <token>`, NOT bring this profile up.
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped

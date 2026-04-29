@@ -7,6 +7,11 @@
 # Single ports binding for HTTP and HTTPS. ACME data and certificates
 # persist under /var/lib/vibe/ingress/ so a Caddy restart doesn't churn
 # Let's Encrypt rate limits.
+#
+# `cloudflared` sidecar is profile-gated behind `--profile tunnel` and
+# only activated by lib/ingress.sh::ingress_compose when vibe.conf has
+# tls_mode=cf-tunnel. One tunnel handles every app behind the ingress —
+# per-app cloudflared sidecars are no longer used.
 
 services:
   caddy:
@@ -34,20 +39,55 @@ services:
     networks:
       - vibe_ingress
     healthcheck:
-      # Caddy serves over HTTPS in `internal` and `acme` modes (auto-https
-      # redirects HTTP → HTTPS so probing :80 always returns 308) and
-      # over plain HTTP in `cf-tunnel` mode (Cloudflare terminates TLS
-      # upstream). Try HTTPS first with --no-check-certificate (the
-      # `tls internal` cert isn't in the container's trust store), and
-      # fall back to HTTP for cf-tunnel. The Host: header matches the
-      # configured site so we hit the /healthz route Caddyfile.template
-      # defines.
-      test: ['CMD-SHELL', 'wget --no-check-certificate -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- https://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok" || wget -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- http://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok"']
+      # Caddy serves HTTPS in every mode now (cf-tunnel uses `tls internal`
+      # and lets cloudflared connect with noTLSVerify). --no-check-certificate
+      # because `tls internal` produces a self-signed cert outside the
+      # container's trust store. The Host header matches the configured
+      # site so we hit the /healthz route in Caddyfile.template.
+      test: ['CMD-SHELL', 'wget --no-check-certificate -q --header "Host: ${VIBE_HOST:-vibe.local}" -O- https://127.0.0.1/healthz 2>/dev/null | grep -q "ingress: ok"']
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
     mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  # Cloudflare Tunnel sidecar — only activated when vibe.conf has
+  # tls_mode=cf-tunnel (lib/ingress.sh::ingress_compose auto-passes
+  # `--profile tunnel` in that mode). Routes the public hostname to
+  # caddy:443 with noTLSVerify so the Caddyfile stays mode-agnostic.
+  #
+  # Token comes from /etc/vibe/cloudflared/tunnel.token (stashed by
+  # install.sh's intent prompt). The .env file pulls it in via
+  # ingress_render_envfile so compose can interpolate ${TUNNEL_TOKEN}
+  # without the operator re-pasting on every reload.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: vibe-ingress-cloudflared
+    profiles: ['tunnel']
+    restart: unless-stopped
+    command: ['tunnel', '--no-autoupdate', '--metrics', '0.0.0.0:2000', 'run', '--token', '${TUNNEL_TOKEN:-MISSING_TUNNEL_TOKEN}']
+    depends_on:
+      caddy:
+        condition: service_healthy
+    networks:
+      - vibe_ingress
+    healthcheck:
+      # cloudflared exposes a /ready endpoint on its metrics port that returns
+      # 200 once the tunnel has at least one healthy connection to a Cloudflare
+      # edge. Strictly better than `restart: unless-stopped` alone — a tunnel
+      # whose token has been revoked or whose route is misconfigured will run
+      # the daemon (Up) without any working connection (Unhealthy).
+      test: ['CMD-SHELL', 'wget -q -O - http://127.0.0.1:2000/ready 2>/dev/null | grep -q "ConnectorID" || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: 128m
     logging:
       driver: json-file
       options:

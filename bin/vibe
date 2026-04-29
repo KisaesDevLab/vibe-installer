@@ -58,7 +58,7 @@ VIBE_VERSION="0.1.0-dev"
 # only when running as root + the install dir exists.
 _should_log_cmd() {
     case "${1:-}" in
-        ""|help|-h|--help|version|-v|--version|status|doctor|mode|upgrade-check|logs|license|cloudflare|report) return 1 ;;
+        ""|help|-h|--help|version|-v|--version|status|doctor|mode|upgrade-check|logs|license|cloudflare|ingress|report) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -101,11 +101,9 @@ Inspection:
   version                   Print vibe-installer version.
 
 Lifecycle:
-  install <app> [opts]      Install a Vibe app or integration:
+  install <app>             Install a Vibe app or integration:
                               apps:         mybooks  connect  tb  payroll  tax
                               integrations: glm-ocr  tailscale  tools
-                            opts: --cloudflare-tunnel <token>
-                                  (apps only; cf-tunnel)
   uninstall <app>           Stop & archive an app's data.
   uninstall --all           Tear down everything (with confirmation).
   upgrade <app> [--to VER]  Pull a new image tag and migrate.
@@ -123,12 +121,16 @@ Operational:
   exec <app> <svc> <cmd>    Run a command inside a container.
   backup <app>              Snapshot the app's host-bind data + env.
   restore <app> <tarball>   Restore from a previous backup tarball.
+  ingress preview           Render the Caddyfile + run caddy validate
+                            without touching the live config.
 
 Auth & secrets:
   license set <app> <token>          Replace an app's license token.
-  cloudflare attach <app> --token T  Activate Cloudflare Tunnel sidecar.
-  cloudflare detach <app>            Stop the sidecar, clear the token.
-  cloudflare status [<app>]          Show attached/detached state.
+  cloudflare set-token [<token>]     Stash a Cloudflare tunnel token + reload
+                                     ingress (one tunnel per appliance).
+  cloudflare clear                   Remove the stashed token.
+  cloudflare status                  Show tls_mode, stash state, sidecar health.
+  cloudflare logs                    Tail the cloudflared sidecar logs.
   rotate-secrets <app>               Rotate non-license secrets.     (v1.1)
 
 Environment overrides:
@@ -248,11 +250,23 @@ cmd_restore() {
 
 cmd_cloudflare() {
     case "${1:-}" in
-        attach)  shift; cloudflare_attach "$@" ;;
-        detach)  shift; cloudflare_detach "$@" ;;
-        status)  shift; cloudflare_status "$@" ;;
-        ""|help) printf 'usage: vibe cloudflare {attach|detach|status} <app> [--token T]\n' ;;
+        set-token) shift; cloudflare_set_token "$@" ;;
+        clear)     shift; cloudflare_clear_stash "$@" ;;
+        status)    shift; cloudflare_status "$@" ;;
+        logs)      shift; cloudflare_logs "$@" ;;
+        # Deprecated — kept so muscle memory still works.
+        attach)    shift; cloudflare_attach "$@" ;;
+        detach)    shift; cloudflare_detach "$@" ;;
+        ""|help)   printf 'usage: vibe cloudflare {set-token|clear|status|logs} [<token>]\n' ;;
         *) err "unknown cloudflare subcommand: $1"; return 64 ;;
+    esac
+}
+
+cmd_ingress() {
+    case "${1:-}" in
+        preview) shift; ingress_preview_caddyfile "$@" ;;
+        ""|help) printf 'usage: vibe ingress {preview}\n' ;;
+        *) err "unknown ingress subcommand: $1"; return 64 ;;
     esac
 }
 
@@ -306,6 +320,7 @@ main() {
         restore)               cmd_restore "$@" ;;
         license)               cmd_license "$@" ;;
         cloudflare)            cmd_cloudflare "$@" ;;
+        ingress)               cmd_ingress "$@" ;;
         upgrade-check)         cmd_upgrade_check "$@" ;;
         report)                cmd_report "$@" ;;
         # Future:

@@ -91,6 +91,10 @@ func (s *Server) RegisterHandlers() {
 		"apps.restore":   s.handleAppsRestore,
 		// --- write / one-shot
 		"license.set":            s.handleLicenseSet,
+		"cloudflare.set_token":   s.handleCloudflareSetToken,
+		"cloudflare.clear":       s.handleCloudflareClear,
+		// Deprecated; forward to the ingress-level handlers above. Kept so
+		// a stale admin UI build doesn't error out post-refactor.
 		"cloudflare.attach":      s.handleCloudflareAttach,
 		"cloudflare.detach":      s.handleCloudflareDetach,
 		"apps.backups.list":      s.handleBackupsList,

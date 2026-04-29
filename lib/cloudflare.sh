@@ -1,67 +1,54 @@
 #!/usr/bin/env bash
-# Cloudflare Tunnel toggle — per-app, customer-owned token.
+# Cloudflare Tunnel toggle — single ingress-level tunnel, customer-owned token.
 #
-# Each app's docker-compose.yml ships a `cloudflared` service under
-#   profiles: ["tunnel"]   (MyBooks, Connect)
-#   profiles: ["cloudflare"]  (Payroll — uses a different name)
+# Lives in ingress/docker-compose.yml as a profile-gated `cloudflared` service
+# under `profiles: [tunnel]`. lib/ingress.sh::ingress_compose auto-passes
+# `--profile tunnel` when vibe.conf has tls_mode=cf-tunnel, so the sidecar
+# follows the rest of the ingress lifecycle (up/down/reload) without any
+# per-app wiring.
 #
-# The installer normalizes both via a per-app profile name in
-# cloudflare_profile_name. Token comes from the firm's own Cloudflare Zero
-# Trust dashboard; the installer never embeds Kisaes credentials.
+# The token comes from the firm's own Cloudflare Zero Trust dashboard;
+# the installer never embeds Kisaes credentials.
 #
 # install.sh::prompt_tls_intent stashes the token at /etc/vibe/cloudflared/
-# tunnel.token (mode 0600) so it can be picked up later by `vibe install
-# <app>` without the operator having to paste it again. cloudflare_load_
-# stashed_token reads + clears that file once it's been applied to a
-# specific app's env so it can't be reused by mistake.
+# tunnel.token (mode 0600). lib/ingress.sh::ingress_render_envfile reads it
+# on every render and exports it as TUNNEL_TOKEN in the ingress's .env so
+# compose can interpolate it into the cloudflared command.
+#
+# Per-app `vibe cloudflare attach <app>` / `detach <app>` — gone. The
+# previous model spun up one cloudflared per app, with no central health,
+# no aggregation, and a broken story for apps that didn't ship a sidecar
+# (TB, Tax). The single-ingress model replaces all of that.
 #
 # common.sh + secrets.sh + apps.sh sourced by callers.
 
-# Where install.sh stashed the operator-supplied tunnel token. Path is
-# relative to VIBE_ETC so a non-default install location stays consistent.
+# Where install.sh stashed the operator-supplied tunnel token.
 cloudflare_token_stash_path() {
     printf '%s/cloudflared/tunnel.token\n' "${VIBE_ETC}"
 }
 
-# Read the stashed token if present. Returns empty string + non-zero status
-# when no stash exists. Caller is responsible for calling
-# cloudflare_clear_stashed_token after the token's been applied to an app
-# so a second `vibe install <app>` doesn't silently reuse the same token.
-cloudflare_read_stashed_token() {
+# Persist a token to the stash. install.sh's stash_cloudflare_token mirrors
+# this — kept here too so `vibe cloudflare set-token` doesn't have to shell
+# out to install.sh.
+cloudflare_stash_token() {
+    require_root
+    local token="$1"
+    [ -n "$token" ] || die "cloudflare_stash_token: empty token"
+    install -d -m 0750 -o "$VIBE_USER" -g "$VIBE_USER" "${VIBE_ETC}/cloudflared"
+    # No trailing newline — cloudflared trims aren't always reliable, and a
+    # trailing \n can make the token look malformed in the dashboard.
+    printf '%s' "$token" > "$(cloudflare_token_stash_path)"
+    chown "$VIBE_USER:$VIBE_USER" "$(cloudflare_token_stash_path)"
+    chmod 0600 "$(cloudflare_token_stash_path)"
+}
+
+cloudflare_clear_stash() {
+    require_root
     local path
     path="$(cloudflare_token_stash_path)"
-    [ -f "$path" ] || return 1
-    cat "$path"
-}
-
-# Best-effort delete of the stash. Owner is `vibe`, but the caller may be
-# either root (vibe install runs require_root) or the vibe user itself —
-# so we don't fail if the unlink can't happen. The dangerous case is leaving
-# the file behind, not failing to delete it (mode 0600 already protects it).
-cloudflare_clear_stashed_token() {
-    local path
-    path="$(cloudflare_token_stash_path)"
-    [ -f "$path" ] || return 0
-    rm -f "$path" 2>/dev/null || warn "couldn't delete stashed token at $path — please remove it manually"
-}
-
-# Per-app Compose profile that activates the cloudflared sidecar.
-cloudflare_profile_name() {
-    case "$1" in
-        payroll) printf 'cloudflare\n' ;;
-        *)       printf 'tunnel\n' ;;
-    esac
-}
-
-# Apps that ship a cloudflared service today. TB is omitted because its
-# upstream prod compose has no cloudflared sidecar yet — `vibe cloudflare
-# attach tb` will be a no-op until that lands.
-cloudflare_supported() {
-    local app="$1"
-    case "$app" in
-        mybooks|connect|payroll) return 0 ;;
-        *)                       return 1 ;;
-    esac
+    [ -f "$path" ] || { ok "no tunnel token stashed"; return 0; }
+    rm -f "$path"
+    ok "tunnel token cleared from $path"
 }
 
 # Redact a Cloudflare token for log output. Keeps the leading 8 chars and
@@ -77,26 +64,22 @@ cloudflare_redact() {
     fi
 }
 
-# `vibe cloudflare attach <app> --token <token>` (or with token on stdin).
-cloudflare_attach() {
+# `vibe cloudflare set-token [<token>]` — stash a new token + re-render the
+# ingress envfile + reload the ingress so the cloudflared sidecar picks up
+# the change. Token via $1, --token, or stdin (in that order). Requires
+# tls_mode=cf-tunnel — refuses on other modes so the operator gets a clear
+# error rather than a token written to disk that nothing reads.
+cloudflare_set_token() {
     require_root
-    local app="${1:-}"
-    [ -n "$app" ] || die "usage: vibe cloudflare attach <app> --token <token>"
-    apps_is_supported "$app" || die "unknown app: $app"
-    cloudflare_supported "$app" || die "cloudflare tunnel not supported for $app yet"
-    config_installed_has "$app" || die "$app is not installed"
-    shift
-
     local token=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --token) token="${2:-}"; shift 2 ;;
-            *) warn "ignoring unknown flag: $1"; shift ;;
+            -*)      warn "ignoring unknown flag: $1"; shift ;;
+            *)       token="$1"; shift ;;
         esac
     done
-
     if [ -z "$token" ] && [ ! -t 0 ]; then
-        # Token piped in on stdin (e.g. via cat secret | vibe cloudflare attach <app>)
         token="$(cat)"
     elif [ -z "$token" ] && [ -t 0 ]; then
         echo
@@ -106,72 +89,88 @@ cloudflare_attach() {
         read -rsp "  Token: " token
         echo
     fi
-
     [ -n "$token" ] || die "no token supplied"
 
-    log "attaching Cloudflare tunnel to ${app} (token $(cloudflare_redact "$token"))"
-
-    secrets_set "$app" CLOUDFLARE_TUNNEL_TOKEN "$token"
-
-    local profile
-    profile="$(cloudflare_profile_name "$app")"
-
-    log "starting cloudflared sidecar for ${app}..."
-    apps_compose "$app" --profile "$profile" up -d cloudflared || {
-        err "failed to start cloudflared sidecar"
-        warn "check token validity at https://one.dash.cloudflare.com/"
-        return 1
-    }
-    ok "cloudflare: ${app} is now reachable via the tunnel"
-    echo
-    log "Verify with:"
-    if [ "$(mode_current)" = "multi" ]; then
-        log "  curl -fsS https://<tunnel-hostname>/${app}/health"
-    else
-        log "  curl -fsS https://<tunnel-hostname>/health"
+    local mode
+    mode="$(config_get tls_mode 2>/dev/null || true)"
+    if [ "$mode" != "cf-tunnel" ]; then
+        warn "current tls_mode=${mode:-unset} — token will be stashed but the"
+        warn "cloudflared sidecar only runs when tls_mode=cf-tunnel. Switch with"
+        warn "  sudo vibe ingress mode cf-tunnel    (not yet implemented — for"
+        warn "  now, re-run install.sh and choose option 3)"
     fi
-    log "  vibe logs ${app} cloudflared"
+
+    cloudflare_stash_token "$token"
+    ok "tunnel token stashed (token $(cloudflare_redact "$token"))"
+
+    # Re-render the env file so TUNNEL_TOKEN gets the new value, then reload
+    # the ingress (no-op if the ingress isn't running yet).
+    ingress_render_envfile
+    if ingress_running; then
+        log "reloading ingress to pick up new tunnel token..."
+        ingress_compose up -d --remove-orphans
+        ok "cloudflared sidecar restarted with new token"
+    else
+        ok "stashed; bring the ingress up with 'sudo vibe mode multi' to start the tunnel"
+    fi
+}
+
+# `vibe cloudflare status` — show whether tls_mode=cf-tunnel, whether a
+# token is stashed, and whether the cloudflared sidecar is running.
+cloudflare_status() {
+    local mode token has_stash="no" sidecar="not running"
+    mode="$(config_get tls_mode 2>/dev/null || true)"
+    if [ -f "$(cloudflare_token_stash_path)" ]; then
+        has_stash="yes"
+        token="$(cat "$(cloudflare_token_stash_path)")"
+    fi
+    if docker ps --filter 'name=^vibe-ingress-cloudflared$' --format '{{.Names}}' 2>/dev/null \
+            | grep -qx vibe-ingress-cloudflared; then
+        sidecar="running"
+    fi
+    log "Cloudflare tunnel:"
+    printf '  tls_mode    %s\n' "${mode:-unset}"
+    printf '  stash       %s' "$has_stash"
+    if [ "$has_stash" = "yes" ]; then
+        printf ' (token %s)' "$(cloudflare_redact "$token")"
+    fi
+    echo
+    printf '  sidecar     %s\n' "$sidecar"
+}
+
+# `vibe cloudflare logs` — tail the ingress-level cloudflared sidecar logs.
+cloudflare_logs() {
+    if ! docker ps --filter 'name=^vibe-ingress-cloudflared$' --format '{{.Names}}' 2>/dev/null \
+            | grep -qx vibe-ingress-cloudflared; then
+        die "cloudflared sidecar isn't running (tls_mode=$(config_get tls_mode 2>/dev/null))"
+    fi
+    docker logs -f --tail=100 vibe-ingress-cloudflared
+}
+
+# ---------- Deprecation shims ----------
+#
+# The pre-2026-04 model had `vibe cloudflare attach <app>` / `detach <app>`
+# spinning up one cloudflared per app. That's gone — the ingress owns the
+# tunnel now. Keep the verbs as friendly redirects so muscle memory still
+# works.
+
+cloudflare_attach() {
+    local app="${1:-}"
+    if [ -n "$app" ]; then
+        warn "'vibe cloudflare attach <app>' is deprecated — the ingress now"
+        warn "owns a single tunnel for every app. To set the token, use:"
+        warn "  sudo vibe cloudflare set-token [<token>]"
+    fi
+    # Forward any --token argument to set-token so old callers keep working.
+    shift || true
+    cloudflare_set_token "$@"
 }
 
 cloudflare_detach() {
-    require_root
-    local app="${1:-}"
-    [ -n "$app" ] || die "usage: vibe cloudflare detach <app>"
-    apps_is_supported "$app" || die "unknown app: $app"
-    cloudflare_supported "$app" || { ok "no cloudflared sidecar for $app — nothing to detach"; return 0; }
-    config_installed_has "$app" || die "$app is not installed"
-
-    local profile
-    profile="$(cloudflare_profile_name "$app")"
-
-    log "stopping cloudflared sidecar for ${app}..."
-    apps_compose "$app" --profile "$profile" stop cloudflared 2>/dev/null || true
-    apps_compose "$app" --profile "$profile" rm -f cloudflared 2>/dev/null || true
-
-    # Clear the token from the env file so a future `up` without --profile
-    # tunnel doesn't accidentally start the sidecar with a stale token.
-    secrets_set "$app" CLOUDFLARE_TUNNEL_TOKEN ""
-    ok "cloudflare: detached ${app}"
-}
-
-cloudflare_status() {
-    local app="${1:-}"
-    if [ -n "$app" ]; then
-        apps_is_supported "$app" || die "unknown app: $app"
-        local token
-        token="$(secrets_get "$app" CLOUDFLARE_TUNNEL_TOKEN 2>/dev/null || true)"
-        if [ -n "$token" ]; then
-            printf '  %-10s attached (token %s)\n' "$app" "$(cloudflare_redact "$token")"
-        else
-            printf '  %-10s not attached\n' "$app"
-        fi
-        return 0
-    fi
-    log "Cloudflare tunnel status:"
-    local a
-    for a in $APPS_SUPPORTED; do
-        cloudflare_supported "$a" || continue
-        config_installed_has "$a" || continue
-        cloudflare_status "$a"
-    done
+    warn "'vibe cloudflare detach <app>' is deprecated — the tunnel is per-ingress"
+    warn "now, not per-app. To stop tunneling entirely, clear the token and"
+    warn "switch tls_mode away from cf-tunnel:"
+    warn "  sudo vibe cloudflare clear"
+    warn "  sudo vibe ingress mode internal     (re-run install.sh to switch modes)"
+    return 1
 }

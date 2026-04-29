@@ -135,10 +135,30 @@ apps_ensure_datadirs() {
 
 # ---------- Install ----------
 
+# `vibe install <app> --cloudflare-tunnel <token>` was the per-app way to
+# wire a Cloudflare tunnel pre-2026-04. The single-ingress refactor moved
+# the tunnel to ingress/docker-compose.yml; the per-app flag is now a no-op.
+# Warn loudly so scripts that still pass it get a clear pointer to the
+# replacement command rather than silent token loss.
+_apps_warn_deprecated_cf_flag() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --cloudflare-tunnel)
+                warn "--cloudflare-tunnel <token> is no longer per-app — the ingress"
+                warn "owns a single tunnel for every app now. Set the token with:"
+                warn "  sudo vibe cloudflare set-token [<token>]"
+                warn "Continuing install without writing the per-app token."
+                shift 2
+                ;;
+            *) warn "ignoring unknown flag: $1"; shift ;;
+        esac
+    done
+}
+
 # Install dispatcher — `vibe install <app> [opts]`.
 apps_install() {
     local app="${1:-}"
-    [ -n "$app" ] || die "usage: vibe install <app> [--cloudflare-tunnel <token>]"
+    [ -n "$app" ] || die "usage: vibe install <app>"
     require_root
     config_init
 
@@ -278,28 +298,7 @@ apps_install_rollback() {
 # ---------- MyBooks install ----------
 apps_install_mybooks() {
     shift || true   # drop "$app"
-    local cf_token=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --cloudflare-tunnel)
-                cf_token="${2:-}"; shift 2
-                [ -n "$cf_token" ] || die "--cloudflare-tunnel requires a token argument"
-                ;;
-            *) warn "ignoring unknown flag: $1"; shift ;;
-        esac
-    done
-
-    # If install.sh stashed a tunnel token during bootstrap (cf-tunnel TLS
-    # mode) and the operator didn't pass --cloudflare-tunnel explicitly,
-    # use the stash. Cleared after first consumption so a subsequent
-    # `vibe install connect` doesn't silently reuse it.
-    if [ -z "$cf_token" ]; then
-        cf_token="$(cloudflare_read_stashed_token 2>/dev/null || true)"
-        if [ -n "$cf_token" ]; then
-            log "using cloudflare tunnel token stashed at $(cloudflare_token_stash_path)"
-            cloudflare_clear_stashed_token
-        fi
-    fi
+    _apps_warn_deprecated_cf_flag "$@"
 
     apps_ensure_datadirs mybooks
 
@@ -310,22 +309,12 @@ apps_install_mybooks() {
     # License activation (env, prompt, or trial fallback).
     license_activate mybooks
 
-    # Cloudflare Tunnel token (if supplied at install time).
-    if [ -n "$cf_token" ]; then
-        secrets_set mybooks CLOUDFLARE_TUNNEL_TOKEN "$cf_token"
-        log "cloudflare: tunnel token written to env (sidecar will start under --profile tunnel)"
-    fi
-
     log "pulling GHCR images for mybooks..."
     apps_compose mybooks pull --quiet
     ok "images pulled"
 
     log "starting mybooks stack..."
-    if [ -n "$cf_token" ]; then
-        apps_compose mybooks --profile tunnel up -d --remove-orphans
-    else
-        apps_compose mybooks up -d --remove-orphans
-    fi
+    apps_compose mybooks up -d --remove-orphans
 
     apps_wait_healthy mybooks api 180 || die "mybooks api failed to become healthy"
     apps_post_install_hint mybooks
@@ -334,21 +323,7 @@ apps_install_mybooks() {
 # ---------- Connect install ----------
 apps_install_connect() {
     shift || true
-    local cf_token=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --cloudflare-tunnel) cf_token="${2:-}"; shift 2 ;;
-            *) warn "ignoring unknown flag: $1"; shift ;;
-        esac
-    done
-
-    if [ -z "$cf_token" ]; then
-        cf_token="$(cloudflare_read_stashed_token 2>/dev/null || true)"
-        if [ -n "$cf_token" ]; then
-            log "using cloudflare tunnel token stashed at $(cloudflare_token_stash_path)"
-            cloudflare_clear_stashed_token
-        fi
-    fi
+    _apps_warn_deprecated_cf_flag "$@"
 
     apps_ensure_datadirs connect
 
@@ -395,20 +370,12 @@ apps_install_connect() {
     secrets_assert_no_placeholders connect
     license_activate connect
 
-    if [ -n "$cf_token" ]; then
-        secrets_set connect CLOUDFLARE_TUNNEL_TOKEN "$cf_token"
-    fi
-
     log "pulling GHCR images for connect..."
     apps_compose connect pull --quiet
     ok "images pulled"
 
     log "starting connect stack..."
-    if [ -n "$cf_token" ]; then
-        apps_compose connect --profile tunnel up -d --remove-orphans
-    else
-        apps_compose connect up -d --remove-orphans
-    fi
+    apps_compose connect up -d --remove-orphans
 
     apps_wait_healthy connect app 180 || die "connect app failed to become healthy"
     apps_post_install_hint connect
@@ -417,13 +384,7 @@ apps_install_connect() {
 # ---------- TB install ----------
 apps_install_tb() {
     shift || true
-    local cf_token=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --cloudflare-tunnel) cf_token="${2:-}"; shift 2 ;;
-            *) warn "ignoring unknown flag: $1"; shift ;;
-        esac
-    done
+    _apps_warn_deprecated_cf_flag "$@"
 
     apps_ensure_datadirs tb
 
@@ -475,10 +436,6 @@ apps_install_tb() {
     secrets_assert_no_placeholders tb
     license_activate tb
 
-    if [ -n "$cf_token" ]; then
-        secrets_set tb CLOUDFLARE_TUNNEL_TOKEN "$cf_token"
-    fi
-
     log "pulling GHCR images for tb..."
     apps_compose tb pull --quiet
     ok "images pulled"
@@ -493,21 +450,7 @@ apps_install_tb() {
 # ---------- Payroll install ----------
 apps_install_payroll() {
     shift || true
-    local cf_token=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --cloudflare-tunnel) cf_token="${2:-}"; shift 2 ;;
-            *) warn "ignoring unknown flag: $1"; shift ;;
-        esac
-    done
-
-    if [ -z "$cf_token" ]; then
-        cf_token="$(cloudflare_read_stashed_token 2>/dev/null || true)"
-        if [ -n "$cf_token" ]; then
-            log "using cloudflare tunnel token stashed at $(cloudflare_token_stash_path)"
-            cloudflare_clear_stashed_token
-        fi
-    fi
+    _apps_warn_deprecated_cf_flag "$@"
 
     apps_ensure_datadirs payroll
     # wal-archive is bind-mounted into the postgres container at
@@ -584,10 +527,6 @@ apps_install_payroll() {
     secrets_assert_no_placeholders payroll
     license_activate payroll
 
-    if [ -n "$cf_token" ]; then
-        secrets_set payroll CLOUDFLARE_TUNNEL_TOKEN "$cf_token"
-    fi
-
     # Verify the GHCR images exist before pulling — Payroll publishes lag
     # behind MyBooks/TB/Connect and prereq P-A may not be in place yet.
     if ! docker manifest inspect "ghcr.io/kisaesdevlab/vibe-payroll-api:${VIBE_PAYROLL_VERSION:-latest}" >/dev/null 2>&1; then
@@ -619,31 +558,9 @@ apps_install_payroll() {
 # Stack: postgres + redis + api + web. The new piece vs other apps is
 # Redis — every per-app data dir is created above; here we only render
 # the env file + assert images exist + bring the stack up.
-#
-# Cloudflare Tunnel: the upstream tax-chat compose doesn't ship a
-# cloudflared sidecar (yet). The --cloudflare-tunnel flag is accepted
-# for symmetry with the other apps but writes the token to the env
-# file's CLOUDFLARE_TUNNEL_TOKEN slot for a future overlay to consume;
-# today it has no effect on the running stack. Operators wanting a
-# tunnel today can use the host-level cloudflared via the integrations
-# UI.
 apps_install_tax() {
     shift || true
-    local cf_token=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --cloudflare-tunnel) cf_token="${2:-}"; shift 2 ;;
-            *) warn "ignoring unknown flag: $1"; shift ;;
-        esac
-    done
-
-    if [ -z "$cf_token" ]; then
-        cf_token="$(cloudflare_read_stashed_token 2>/dev/null || true)"
-        if [ -n "$cf_token" ]; then
-            log "using cloudflare tunnel token stashed at $(cloudflare_token_stash_path)"
-            cloudflare_clear_stashed_token
-        fi
-    fi
+    _apps_warn_deprecated_cf_flag "$@"
 
     apps_ensure_datadirs tax
 
@@ -702,11 +619,6 @@ apps_install_tax() {
 
     secrets_assert_no_placeholders tax
     license_activate tax
-
-    if [ -n "$cf_token" ]; then
-        secrets_set tax CLOUDFLARE_TUNNEL_TOKEN "$cf_token"
-        warn "cloudflare token stored — note: tax-chat doesn't ship a tunnel sidecar yet"
-    fi
 
     # Verify GHCR images exist before pulling — prereq T-A (the
     # release.yml workflow on Vibe-Tax-Research-Chat:feat/installer-readiness)

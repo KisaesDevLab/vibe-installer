@@ -48,6 +48,17 @@ ingress_render_envfile() {
     # unattended installs that set VIBE_ACME_EMAIL/ACME_EMAIL keep working.
     email="$(config_get acme_email)"
     [ -z "$email" ] && email="${VIBE_ACME_EMAIL:-${ACME_EMAIL:-}}"
+    # In cf-tunnel mode, pull the stashed token from
+    # /etc/vibe/cloudflared/tunnel.token so compose can interpolate
+    # ${TUNNEL_TOKEN} into the cloudflared sidecar's command. Empty in
+    # other modes (the sidecar is profile-gated and never started).
+    local tunnel_token=""
+    if [ "${tls:-internal}" = "cf-tunnel" ]; then
+        local stash="${VIBE_ETC}/cloudflared/tunnel.token"
+        if [ -r "$stash" ]; then
+            tunnel_token="$(cat "$stash")"
+        fi
+    fi
     {
         printf 'VIBE_HOST=%s\n'       "${host:-vibe.local}"
         # IP gets baked into the cert as a SAN (see ingress_render_caddyfile)
@@ -58,8 +69,11 @@ ingress_render_envfile() {
         printf 'INGRESS_HTTP_PORT=%s\n'  "${INGRESS_HTTP_PORT:-80}"
         printf 'INGRESS_HTTPS_PORT=%s\n' "${INGRESS_HTTPS_PORT:-443}"
         printf 'ACME_EMAIL=%s\n'      "${email}"
+        printf 'TUNNEL_TOKEN=%s\n'    "${tunnel_token}"
     } > "$env"
-    chmod 0640 "$env"
+    # 0600 — file now contains the cf-tunnel token (when in cf-tunnel mode).
+    # Was 0640 before that field existed.
+    chmod 0600 "$env"
     chown "$VIBE_USER:$VIBE_USER" "$env"
 }
 
@@ -78,33 +92,27 @@ ingress_render_caddyfile() {
     tls="$(config_get tls_mode)"
     [ -n "$host" ] || die "host not set in $VIBE_CONF (rerun install.sh)"
 
-    # 0. Build the site host list: hostname only, OR `hostname, ip` so
-    #    Caddy mints an internal cert covering both. ACME and cf-tunnel
-    #    skip the IP — Let's Encrypt won't issue for an IP, and a
-    #    cf-tunnel target hostname is the only thing the tunnel routes
-    #    to anyway. The placeholder is replaced via awk; Caddy's own
-    #    {$VIBE_HOST} substitution still works for the hostname leg.
-    #
-    #    cf-tunnel mode prefixes `http://` so Caddy serves the site on
-    #    plain :80 only — `auto_https` is a *global* directive in
-    #    Caddy and would crash the config if placed inside a site
-    #    block. The `http://` scheme is the per-site way to opt out
-    #    of HTTPS, and is the right shape for cloudflared which
-    #    terminates TLS at the edge.
+    # Site host list: hostname only, OR `hostname, ip` so Caddy mints an
+    # internal cert covering both. Only `internal` mode adds the LAN IP
+    # SAN — `acme` can't (Let's Encrypt won't issue for an IP), and
+    # `cf-tunnel` doesn't need it (the tunnel only ever sees the hostname).
     local site_hosts="{\$VIBE_HOST}"
     if [ "$tls" = "internal" ] && [ -n "$host_ip" ]; then
         site_hosts="{\$VIBE_HOST}, ${host_ip}"
-    elif [ "$tls" = "cf-tunnel" ]; then
-        site_hosts="http://{\$VIBE_HOST}"
     fi
 
-    # 1. Build the @@TLS_DIRECTIVE@@ + @@EMAIL_LINE@@ blocks.
+    # TLS directive + ACME email line.
+    #
+    # cf-tunnel inherits `tls internal` from the internal arm: cloudflared
+    # connects to caddy:443 with `noTLSVerify: true`, so a self-signed cert
+    # at the Caddy layer is fine. This collapses what used to be a third
+    # branch (plain HTTP via `http://` scheme prefix) — the source of every
+    # cf-tunnel renderer bug shipped in 8589e3c and f790696.
     local tls_directive="" email_line=""
     case "$tls" in
-        internal)
+        internal|cf-tunnel)
             tls_directive=$'    tls internal'
-            # No ACME, no email needed.
-            email_line=$'    # tls=internal — no ACME registration'
+            email_line=$'    # tls='"${tls}"$' — no ACME registration'
             ;;
         acme)
             # Caddy with global `email` directive handles HTTP-01 automatically.
@@ -123,14 +131,6 @@ ingress_render_caddyfile() {
                 # be deliverable).
                 email_line=$'    # tls=acme but no acme_email set; renewal alerts disabled'
             fi
-            ;;
-        cf-tunnel)
-            # No TLS at the Caddy layer; cloudflared terminates upstream.
-            # The `http://` scheme on SITE_HOSTS (set above) tells Caddy
-            # to serve plain HTTP and skip auto-HTTPS for this site, so
-            # nothing needs to go inside the site block here.
-            tls_directive=$'    # tls=cf-tunnel — plain HTTP, Cloudflare terminates TLS at the edge'
-            email_line=$'    # tls=cf-tunnel — no ACME registration'
             ;;
         *) die "unknown tls_mode: $tls (expected internal|acme|cf-tunnel)" ;;
     esac
@@ -161,18 +161,12 @@ ingress_render_caddyfile() {
         fi
     done
 
-    # 3. The cf-tunnel mode is served by the same `${VIBE_HOST}` block above
-    #    — `auto_https off` makes Caddy listen on plain :80 only, which is
-    #    exactly what cloudflared connects to. No second site block needed.
-    local cf_block=""
-
-    # 4. Substitute placeholders.
+    # Substitute placeholders.
     local out
     out="$(ingress_caddyfile_path)"
-    awk -v tls="$tls_directive" -v frags="$fragments" -v cfb="$cf_block" -v eml="$email_line" -v sh="$site_hosts" '
+    awk -v tls="$tls_directive" -v frags="$fragments" -v eml="$email_line" -v sh="$site_hosts" '
         { gsub(/@@TLS_DIRECTIVE@@/, tls);
           gsub(/@@APP_FRAGMENTS@@/, frags);
-          gsub(/@@CF_TUNNEL_BLOCK@@/, cfb);
           gsub(/@@EMAIL_LINE@@/, eml);
           gsub(/@@SITE_HOSTS@@/, sh);
           print }
@@ -180,10 +174,79 @@ ingress_render_caddyfile() {
     chmod 0644 "$out"
     chown "$VIBE_USER:$VIBE_USER" "$out"
 
-    # 5. Update the installed-apps JSON the landing page reads.
+    # Validate before any caller (ingress_up / ingress_reload) gets a chance
+    # to push a busted config into the live container. Both shipped cf-tunnel
+    # bugs (auto_https-in-site-block, healthcheck wrong protocol) would have
+    # tripped this check.
+    ingress_validate_caddyfile "$out"
+
+    # Update the installed-apps JSON the landing page reads.
     ingress_render_installed_json
 
     ok "ingress: rendered ${out} (host=${host}, tls=${tls})"
+}
+
+# Run `caddy validate` against a rendered Caddyfile. Prefers a host-installed
+# `caddy` binary (fast) and falls back to a one-shot `caddy:2-alpine` docker
+# run (works on any host with docker). Returns 0 on a valid config and dies
+# on an invalid one — callers should not catch the exit; bailing is the
+# point of validation.
+#
+# VIBE_HOST is exported into the validator's env because Caddyfile.template
+# references it via `{$VIBE_HOST}`. With it unset, the substitution yields
+# the empty string, which makes Caddy parse the site block as a second
+# global block and bail with "server block without any key is global
+# configuration". Other vars (TLS_MODE, ACME_EMAIL) are read by lib/ingress.sh
+# during render and don't survive into the rendered file as `{$NAME}`
+# substitutions, so they don't need to be in the validator env.
+ingress_validate_caddyfile() {
+    local file="${1:?usage: ingress_validate_caddyfile <path>}"
+    local host
+    host="$(config_get host 2>/dev/null || true)"
+    [ -z "$host" ] && host="vibe.local"
+    if has_cmd caddy; then
+        if ! VIBE_HOST="$host" caddy validate --config "$file" --adapter caddyfile >/dev/null 2>&1; then
+            err "rendered Caddyfile failed validation:"
+            VIBE_HOST="$host" caddy validate --config "$file" --adapter caddyfile >&2 || true
+            die "refusing to apply invalid Caddyfile (${file})"
+        fi
+    elif has_cmd docker; then
+        if ! docker run --rm -i -e "VIBE_HOST=${host}" caddy:2-alpine \
+                caddy validate --config /dev/stdin --adapter caddyfile <"$file" >/dev/null 2>&1; then
+            err "rendered Caddyfile failed validation:"
+            docker run --rm -i -e "VIBE_HOST=${host}" caddy:2-alpine \
+                caddy validate --config /dev/stdin --adapter caddyfile <"$file" >&2 || true
+            die "refusing to apply invalid Caddyfile (${file})"
+        fi
+    else
+        warn "ingress: neither 'caddy' nor 'docker' available — skipping Caddyfile validation"
+        return 0
+    fi
+    dbg "ingress: ${file} passed caddy validate"
+}
+
+# Render to a tmp dir + validate without touching the live config. Used by
+# `vibe ingress preview` so an operator can sanity-check changes before
+# reloading the running container.
+ingress_preview_caddyfile() {
+    require_root
+    local tmp_etc tmp_file saved_etc
+    tmp_etc="$(mktemp -d)"
+    saved_etc="$INGRESS_ETC"
+    # Restore INGRESS_ETC + clean up tmp dir on every exit path — render
+    # may `die`, in which case we'd otherwise leak a redirected global.
+    trap 'INGRESS_ETC="'"$saved_etc"'"; rm -rf "'"$tmp_etc"'"; trap - RETURN' RETURN
+
+    INGRESS_ETC="$tmp_etc"
+    ingress_render_caddyfile
+    tmp_file="$(ingress_caddyfile_path)"
+
+    echo
+    log "rendered Caddyfile (preview only — live config untouched):"
+    echo
+    cat "$tmp_file"
+    echo
+    ok "preview validated"
 }
 
 # Tiny JSON the landing page fetches to hide tiles for uninstalled apps.
@@ -209,11 +272,21 @@ ingress_render_installed_json() {
 }
 
 # ---------- Compose lifecycle ----------
+# In cf-tunnel mode, `--profile tunnel` is auto-prepended so the cloudflared
+# sidecar (defined in ingress/docker-compose.yml under `profiles: [tunnel]`)
+# gets brought up alongside Caddy. Other modes leave the profile inactive
+# and the sidecar stays down — single source of truth: vibe.conf.
 ingress_compose() {
-    local env
+    local env tls
     env="$(ingress_envfile_path)"
+    tls="$(config_get tls_mode 2>/dev/null || true)"
+    local profile_args=()
+    if [ "$tls" = "cf-tunnel" ]; then
+        profile_args=(--profile tunnel)
+    fi
     docker compose --project-name "$INGRESS_PROJECT" \
                    --env-file "$env" \
+                   "${profile_args[@]}" \
                    -f "$INGRESS_COMPOSE" "$@"
 }
 

@@ -50,10 +50,3 @@
         level INFO
     }
 }
-
-# =====================================================================
-# In `cf-tunnel` mode, also accept plain HTTP on the cloudflared-private
-# loopback so the tunnel can route to us. Cloudflare terminates TLS at
-# the edge.
-# =====================================================================
-@@CF_TUNNEL_BLOCK@@

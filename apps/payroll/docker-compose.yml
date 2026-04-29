@@ -139,9 +139,13 @@ services:
   # --------------------------------------------------------------------------
   # Cloudflare Tunnel sidecar (profile: cloudflare)
   #
-  # Provision a tunnel at https://one.dash.cloudflare.com, paste the generated
-  # token into CLOUDFLARE_TUNNEL_TOKEN, and configure the tunnel to route to
-  # `http://caddy:8080`. No ports are exposed on the host.
+  # NOTE (2026-04 single-ingress refactor): the vibe-installer no longer
+  # activates this sidecar. The ingress (ingress/docker-compose.yml) owns
+  # a single cloudflared for every installed app; lib/apps.sh never
+  # passes `--profile cloudflare` to apps_compose anymore. This block
+  # stays only because this file is vendored. Operators wanting a tunnel
+  # should run `sudo vibe cloudflare set-token <token>`, not bring this
+  # profile up directly.
   # --------------------------------------------------------------------------
   cloudflared:
     image: cloudflare/cloudflared:latest

@@ -1,5 +1,62 @@
 # Changelog
 
+## v1.15.0 — Unreleased (single-ingress cf-tunnel refactor)
+
+### Changed — Cloudflare Tunnel is now per-ingress, not per-app
+
+The previous model spun up one `cloudflared` container per installed
+app, each with its own token. This shipped two production bugs in
+`lib/ingress.sh::ingress_render_caddyfile` (cf-tunnel mode used a
+different site-host scheme + needed an `auto_https off` directive that
+Caddy rejected inside a site block) and made cf-tunnel mode untestable
+end-to-end. The whole mode-branching renderer is now collapsed.
+
+- **`lib/ingress.sh`** — `ingress_render_caddyfile` reduced from three
+  TLS branches to two (`internal`/`cf-tunnel` share `tls internal`;
+  `acme` overrides). Caddy serves HTTPS in every mode now; cloudflared
+  connects to `caddy:443` with `noTLSVerify`, so cf-tunnel needs no
+  scheme gymnastics. New `ingress_validate_caddyfile` runs `caddy
+  validate` on every render before applying — both shipped cf-tunnel
+  bugs would have tripped this. New `ingress_preview_caddyfile`
+  renders + validates against a tmp dir without touching live config.
+  `ingress_compose` auto-passes `--profile tunnel` when
+  `tls_mode=cf-tunnel`.
+
+- **`ingress/Caddyfile.template`** — dropped the dead
+  `@@CF_TUNNEL_BLOCK@@` placeholder + the cf-tunnel-only second site
+  block. Down from 5 placeholders to 4.
+
+- **`ingress/docker-compose.yml`** — added a profile-gated
+  `cloudflared` sidecar. One tunnel handles every installed app.
+  Healthcheck probes the cloudflared `/ready` metrics endpoint so a
+  revoked token surfaces as `Unhealthy` instead of a `Up` container
+  with a dead tunnel.
+
+- **`lib/cloudflare.sh`** — replaced per-app `attach`/`detach` with
+  `set-token` / `clear` / `status` / `logs` operating on the
+  ingress-level sidecar. The old verbs are kept as deprecated
+  redirects.
+
+- **`lib/apps.sh`** — `apps_install_{mybooks,connect,tb,payroll,tax}`
+  no longer accept `--cloudflare-tunnel <token>` as a meaningful flag.
+  `_apps_warn_deprecated_cf_flag` parses + warns + redirects to
+  `vibe cloudflare set-token`.
+
+- **`bin/vibe`** — new `ingress preview` subcommand. New
+  `cloudflare {set-token,clear,status,logs}` subcommands; old
+  `attach`/`detach` kept as deprecation shims.
+
+- **`tools/vibed/handlers.go`** — `cloudflare.set_token` and
+  `cloudflare.clear` RPC methods. `cloudflare.status` returns
+  `{tls_mode, token_attached, redacted_token, sidecar_running, apps:[]}`.
+  Old `cloudflare.attach`/`cloudflare.detach` and the `apps.install`
+  `cloudflare_tunnel` field are kept as deprecated forwarders so a
+  stale admin UI build doesn't crash.
+
+- **`apps/{mybooks,payroll}/docker-compose.yml`** — vendored upstream
+  `cloudflared` services kept verbatim (would otherwise diverge from
+  upstream) but annotated as installer-no-op.
+
 ## v1.14.0 — Unreleased (5th app: Vibe Tax Research Chat)
 
 ### Added — fifth product app: `tax` (Vibe Tax Research Chat)

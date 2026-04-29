@@ -66,9 +66,11 @@ snapshot or `jobs.stream` to follow output as it's produced.
 | `apps.backup` | `{job_id}` | `vibe backup <app>` |
 | `apps.backups.list` | `{app, backups[]}` | Filesystem read |
 | `license.set` | `{raw}` | `vibe license set <app> <token>` |
-| `cloudflare.attach` | `{raw}` | `vibe cloudflare attach <app> --token T` |
-| `cloudflare.detach` | `{raw}` | `vibe cloudflare detach <app>` |
-| `cloudflare.status` | `{raw}` | `vibe cloudflare status [<app>]` |
+| `cloudflare.set_token` | `{raw}` | `vibe cloudflare set-token <token>` |
+| `cloudflare.clear` | `{raw}` | `vibe cloudflare clear` |
+| `cloudflare.status` | `{tls_mode, token_attached, redacted_token, sidecar_running, apps:[]}` | Reads `/etc/vibe/vibe.conf` + `tunnel.token` + `docker ps` |
+| `cloudflare.attach` | (deprecated → set_token) | `app` field ignored |
+| `cloudflare.detach` | (deprecated → clear) | `app` field ignored |
 | `jobs.status` | `JobSnapshot` | Snapshot of one job |
 | `jobs.list` | `[Job, ...]` | Recent + in-flight jobs |
 | `jobs.stream` | streaming | One JSON object per line per output line |

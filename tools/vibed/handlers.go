@@ -24,7 +24,11 @@ type appParams struct {
 }
 
 type installParams struct {
-	App              string `json:"app"`
+	App string `json:"app"`
+	// CloudflareTunnel was the per-app token slot pre-2026-04. The
+	// single-ingress refactor moved tunnel ownership to the ingress;
+	// this field is parsed but ignored. Set the tunnel token via
+	// `cloudflare.set_token` instead.
 	CloudflareTunnel string `json:"cloudflare_tunnel,omitempty"`
 }
 
@@ -44,7 +48,14 @@ type licenseSetParams struct {
 }
 
 type cloudflareAttachParams struct {
-	App   string `json:"app"`
+	// App is parsed for backwards compatibility but ignored — the
+	// single-ingress refactor (2026-04) made the tunnel per-ingress,
+	// not per-app.
+	App   string `json:"app,omitempty"`
+	Token string `json:"token"`
+}
+
+type cloudflareSetTokenParams struct {
 	Token string `json:"token"`
 }
 
@@ -169,50 +180,52 @@ func (s *Server) handleAppsUpgradeCheck(ctx context.Context, _ json.RawMessage, 
 	}, nil
 }
 
-// cloudflare.status returns whether the per-app cloudflared sidecar
-// has a token attached. Two shapes depending on params:
+// cloudflare.status returns the ingress-level tunnel state. The per-app
+// shape was retired in the single-ingress refactor (2026-04); the
+// `apps:[]` field is kept as an empty array so any pre-refactor admin UI
+// build can still parse the response without crashing.
 //
-//   {} or no app  → {apps: [{app, attached, redacted_token}, ...]}
-//   {app: "<id>"} → {app, attached, redacted_token}
-//
-// `attached` is computed from the presence of CLOUDFLARE_TUNNEL_TOKEN
-// in the per-app env file — the same source-of-truth lib/cloudflare.sh
-// uses. Reading the file directly avoids subprocess overhead AND the
-// human-text parsing that the previous {raw} shape forced on the SPA.
-func (s *Server) handleCloudflareStatus(_ context.Context, params json.RawMessage, _ net.Conn) (any, error) {
-	var p appParams
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &p); err != nil {
-			return nil, errInvalidParams("invalid params: %v", err)
-		}
-	}
+//	{
+//	  tls_mode:        "internal" | "acme" | "cf-tunnel",
+//	  token_attached:  bool,           // /etc/vibe/cloudflared/tunnel.token exists
+//	  redacted_token:  "abc12345…wxyz" | "",
+//	  sidecar_running: bool,           // vibe-ingress-cloudflared container up
+//	  apps:            []              // legacy shape, always empty now
+//	}
+func (s *Server) handleCloudflareStatus(_ context.Context, _ json.RawMessage, _ net.Conn) (any, error) {
+	tlsMode := readConfField("/etc/vibe/vibe.conf", "tls_mode")
 
-	if p.App != "" {
-		token := readEnvVar(filepath.Join("/etc/vibe", p.App, ".env"), "CLOUDFLARE_TUNNEL_TOKEN")
-		return map[string]any{
-			"app":            p.App,
-			"attached":       token != "",
-			"redacted_token": redactCloudflareToken(token),
-		}, nil
-	}
+	tokenPath := "/etc/vibe/cloudflared/tunnel.token"
+	tokenBytes, _ := os.ReadFile(tokenPath)
+	token := strings.TrimSpace(string(tokenBytes))
 
-	installed, _ := readInstalledApps()
-	out := make([]map[string]any, 0, len(installed))
-	for _, app := range installed {
-		token := readEnvVar(filepath.Join("/etc/vibe", app, ".env"), "CLOUDFLARE_TUNNEL_TOKEN")
-		out = append(out, map[string]any{
-			"app":            app,
-			"attached":       token != "",
-			"redacted_token": redactCloudflareToken(token),
-		})
-	}
-	return map[string]any{"apps": out}, nil
+	sidecarRunning := dockerContainerExists("vibe-ingress-cloudflared")
+
+	return map[string]any{
+		"tls_mode":        tlsMode,
+		"token_attached":  token != "",
+		"redacted_token":  redactCloudflareToken(token),
+		"sidecar_running": sidecarRunning,
+		"apps":            []any{},
+	}, nil
 }
 
-// readEnvVar parses a KEY=VALUE-style env file and returns the value
-// for `key`. Returns empty string for missing files / missing keys /
-// blank values. Strips a single pair of surrounding "" or '' quotes.
-func readEnvVar(path, key string) string {
+// dockerContainerExists returns true iff a container with the exact name
+// is currently running. Cheaper than `docker inspect` because it doesn't
+// shell-fork unless the daemon is reachable.
+func dockerContainerExists(name string) bool {
+	cmd := exec.Command("docker", "ps", "--filter", "name=^"+name+"$", "--format", "{{.Names}}")
+	cmd.Env = inheritedEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == name
+}
+
+// readConfField pulls a single `key=value` line out of vibe.conf.
+// Returns "" if the file doesn't exist or the key is absent.
+func readConfField(path, key string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -220,14 +233,9 @@ func readEnvVar(path, key string) string {
 	prefix := key + "="
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, prefix) {
-			continue
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
 		}
-		v := strings.TrimPrefix(line, prefix)
-		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-			v = v[1 : len(v)-1]
-		}
-		return strings.TrimSpace(v)
 	}
 	return ""
 }
@@ -258,9 +266,9 @@ func (s *Server) handleAppsInstall(_ context.Context, params json.RawMessage, _ 
 	}
 
 	args := []string{"install", p.App}
-	if p.CloudflareTunnel != "" {
-		args = append(args, "--cloudflare-tunnel", p.CloudflareTunnel)
-	}
+	// p.CloudflareTunnel is intentionally ignored — the per-app
+	// `--cloudflare-tunnel` flag is a no-op since 2026-04. The admin UI
+	// should call `cloudflare.set_token` to wire the ingress-level tunnel.
 
 	job, ctx := s.Jobs.Begin("apps.install", p.App)
 	go runJobSubprocess(ctx, job, s.Cfg, args)
@@ -373,34 +381,53 @@ func (s *Server) handleLicenseSet(ctx context.Context, params json.RawMessage, _
 	return map[string]any{"raw": string(out)}, nil
 }
 
-func (s *Server) handleCloudflareAttach(ctx context.Context, params json.RawMessage, _ net.Conn) (any, error) {
-	var p cloudflareAttachParams
+// cloudflare.set_token — stash an operator-supplied tunnel token at the
+// ingress level + reload the cloudflared sidecar. Replaces the per-app
+// `cloudflare.attach` from the pre-2026-04 model.
+func (s *Server) handleCloudflareSetToken(ctx context.Context, params json.RawMessage, _ net.Conn) (any, error) {
+	var p cloudflareSetTokenParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, errInvalidParams("invalid params: %v", err)
 	}
-	if p.App == "" || p.Token == "" {
-		return nil, errInvalidParams("app and token are required")
+	if p.Token == "" {
+		return nil, errInvalidParams("token is required")
 	}
-	out, err := runVibe(ctx, s.Cfg, "cloudflare", "attach", p.App, "--token", p.Token)
+	out, err := runVibe(ctx, s.Cfg, "cloudflare", "set-token", p.Token)
 	if err != nil {
 		return nil, errSubprocess(err.Error())
 	}
 	return map[string]any{"raw": string(out)}, nil
 }
 
-func (s *Server) handleCloudflareDetach(ctx context.Context, params json.RawMessage, _ net.Conn) (any, error) {
-	var p appParams
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, errInvalidParams("invalid params: %v", err)
-	}
-	if p.App == "" {
-		return nil, errInvalidParams("app is required")
-	}
-	out, err := runVibe(ctx, s.Cfg, "cloudflare", "detach", p.App)
+// cloudflare.clear — remove the stashed tunnel token. Replaces per-app
+// `cloudflare.detach`.
+func (s *Server) handleCloudflareClear(ctx context.Context, _ json.RawMessage, _ net.Conn) (any, error) {
+	out, err := runVibe(ctx, s.Cfg, "cloudflare", "clear")
 	if err != nil {
 		return nil, errSubprocess(err.Error())
 	}
 	return map[string]any{"raw": string(out)}, nil
+}
+
+// Deprecated wrappers — kept so a stale admin UI build can still ride
+// over the refactor without crashing. Both forward to the ingress-level
+// commands; any `app` param is ignored.
+
+func (s *Server) handleCloudflareAttach(ctx context.Context, params json.RawMessage, conn net.Conn) (any, error) {
+	var p cloudflareAttachParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, errInvalidParams("invalid params: %v", err)
+	}
+	if p.Token == "" {
+		return nil, errInvalidParams("token is required")
+	}
+	// Forward to set_token. The per-app `app` field is silently dropped.
+	stPayload, _ := json.Marshal(cloudflareSetTokenParams{Token: p.Token})
+	return s.handleCloudflareSetToken(ctx, stPayload, conn)
+}
+
+func (s *Server) handleCloudflareDetach(ctx context.Context, _ json.RawMessage, conn net.Conn) (any, error) {
+	return s.handleCloudflareClear(ctx, nil, conn)
 }
 
 func (s *Server) handleBackupsList(_ context.Context, params json.RawMessage, _ net.Conn) (any, error) {

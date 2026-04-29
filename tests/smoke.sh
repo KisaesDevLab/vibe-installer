@@ -49,6 +49,11 @@ curl -fsSk "https://${VIBE_HOST}/healthz" >/dev/null \
     || fail "ingress /healthz unreachable directly after bootstrap"
 vibe mode | grep -q multi || fail "expected mode=multi after bootstrap"
 
+# `vibe ingress preview` renders + caddy-validates without touching live
+# config. A regression in lib/ingress.sh::ingress_render_caddyfile would
+# trip this whether or not cf-tunnel is in use.
+vibe ingress preview >/dev/null || fail "vibe ingress preview failed (rendered Caddyfile is invalid)"
+
 # ---------- 1. First app: lands behind the ingress immediately ----------
 first_app="${VIBE_SMOKE_APPS%% *}"
 step "install $first_app (multi-app, via ingress)"
@@ -114,15 +119,31 @@ for app in $VIBE_SMOKE_APPS; do
         || fail "expected DB container $container running"
 done
 
-# ---------- 5. Cloudflare attach/detach (optional) ----------
-if [ -n "${CF_TUNNEL_TOKEN_MYBOOKS:-}" ] && echo "$VIBE_SMOKE_APPS" | grep -qw mybooks; then
-    step "cloudflare attach mybooks"
-    vibe cloudflare attach mybooks --token "$CF_TUNNEL_TOKEN_MYBOOKS" || fail "cf attach failed"
-    docker ps --filter 'name=mybooks-cloudflared' --format '{{.Names}}' | grep -q . \
-        || fail "cloudflared sidecar not running"
-    vibe cloudflare detach mybooks || fail "cf detach failed"
-    docker ps --filter 'name=mybooks-cloudflared' --format '{{.Names}}' | grep -q . \
-        && fail "cloudflared sidecar still running after detach"
+# ---------- 5. Cloudflare set-token / clear (optional) ----------
+# Post-2026-04 the tunnel is per-ingress, not per-app — one cloudflared
+# sidecar inside the vibe-ingress compose handles every installed app.
+# CF_TUNNEL_TOKEN_MYBOOKS keeps its old name for CI compatibility but
+# the token is no longer mybooks-specific.
+if [ -n "${CF_TUNNEL_TOKEN_MYBOOKS:-}" ] && [ "$VIBE_TLS_MODE" = "cf-tunnel" ]; then
+    step "cloudflare set-token (ingress-level)"
+    vibe cloudflare set-token "$CF_TUNNEL_TOKEN_MYBOOKS" || fail "cf set-token failed"
+    docker ps --filter 'name=^vibe-ingress-cloudflared$' --format '{{.Names}}' | grep -q . \
+        || fail "ingress cloudflared sidecar not running"
+    # Wait briefly for the sidecar's healthcheck to flip to healthy; the
+    # /ready endpoint becomes 200 once the tunnel has at least one
+    # connection to a Cloudflare edge.
+    deadline=$(( $(date +%s) + 60 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        state=$(docker inspect -f '{{.State.Health.Status}}' vibe-ingress-cloudflared 2>/dev/null || echo unknown)
+        [ "$state" = "healthy" ] && break
+        sleep 3
+    done
+    [ "$state" = "healthy" ] || fail "cloudflared sidecar didn't reach healthy (last=$state)"
+
+    step "cloudflare clear"
+    vibe cloudflare clear || fail "cf clear failed"
+    [ -f /etc/vibe/cloudflared/tunnel.token ] \
+        && fail "tunnel.token still present after cloudflare clear"
 fi
 
 # ---------- 6. Tailscale (optional) ----------

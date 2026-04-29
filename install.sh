@@ -953,17 +953,12 @@ print_next_steps() {
     [ -z "$tls" ] && tls="$(grep -E '^tls_mode=' "$VIBE_ETC/vibe.conf" 2>/dev/null | cut -d= -f2)"
     [ -z "$tls" ] && tls="internal"
 
-    # Pick schemes. The hostname and IP fallback don't always share one:
-    #   internal  : both speak https (self-signed) — Caddy auto_https on
-    #   acme      : both speak https — Caddy issued a real cert
-    #   cf-tunnel : hostname is https (Cloudflare terminates at edge),
-    #               but Caddy locally listens with `auto_https off` on
-    #               plain :80, so the LAN IP fallback is http only.
+    # Caddy serves HTTPS in every mode — internal + cf-tunnel use a
+    # self-signed cert (cloudflared connects with noTLSVerify in cf-tunnel
+    # mode), acme uses a real Let's Encrypt cert. Both the hostname and
+    # the LAN IP fallback are reachable over HTTPS.
     local host_scheme="https"
     local ip_scheme="https"
-    if [ "$tls" = "cf-tunnel" ]; then
-        ip_scheme="http"
-    fi
 
     local ip
     ip="$(primary_ipv4 || true)"
